@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tase2-phase-switching"
+version = "0.1.0"
+description = "Desktop analysis application for TaSe2 phase-switching datasets"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=2.0",
+  "matplotlib>=3.10",
+  "xarray>=2024.11.0",
+  "h5netcdf>=1.3",
+  "scipy>=1.15",
+]
+
+[project.scripts]
+tase2-desktop = "tase2_phase_switching.desktop_app:main"
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
