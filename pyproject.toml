@@ -18,6 +18,7 @@ dependencies = [
 
 [project.scripts]
 tase2-desktop = "tase2_phase_switching.desktop_app:main"
+tase2-simulator = "simulations.simulation_app:main"
 
 [tool.setuptools.package-dir]
 "" = "src"

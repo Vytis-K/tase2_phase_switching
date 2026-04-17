@@ -12,6 +12,17 @@ Desktop analysis tooling for TaSe2 phase-switching datasets, with the notebook w
 - Lets you click any pixel to inspect its local spectrum across the full sequence.
 - Exports the analysis outputs as `.json` summaries and `.npy` arrays.
 
+## What the simulator does
+
+- Infers an interpretable sample geometry from a real sequence of NetCDF states.
+- Estimates thickness, roughness, and boundary-pinning maps from the measured intensity changes.
+- Replays current propagation with a 2D drift-style transport solver and tracer particles.
+- Evolves insulating/intermediate/metallic CDW fractions with direction-sensitive switching.
+- Exports compact synthetic NetCDF sequences so you can perturb geometry and re-run the analyzer on simulated data.
+- Includes a bundled smoke test for `a -> b -> c -> d`.
+
+The simulator currently infers the bundled `a/b/c/d` pulse axes from the dominant switched regions rather than hard-coded labels, so the GUI will show the measured angle and direction class it extracted from the data.
+
 ## Launch the desktop app
 
 ### Option 1: run from the repository
@@ -33,6 +44,25 @@ pip install -e .
 tase2-desktop
 ```
 
+## Launch the simulator
+
+### Option 1: run from the repository
+
+```bash
+python run_simulation_app.py
+```
+
+### Option 2: install the package and use the script entry point
+
+```bash
+pip install -e .
+tase2-simulator
+```
+
+### macOS shortcut
+
+You can also double-click `launch_tase2_simulator.command` after dependencies are installed.
+
 ### macOS shortcut
 
 You can also double-click `launch_tase2_app.command` after dependencies are installed.
@@ -49,6 +79,7 @@ The app uses a NumPy-based PCA and k-means implementation, so it does not depend
 
 ```bash
 python -m unittest tests.test_analysis_pipeline
+python -m unittest tests.test_simulation_pipeline
 ```
 
 ## Build a standalone executable
@@ -66,5 +97,9 @@ That creates a bundled executable in `dist/`.
 
 - `src/tase2_phase_switching/analysis.py`: reusable notebook-derived analysis pipeline.
 - `src/tase2_phase_switching/desktop_app.py`: desktop UI built with `tkinter` and embedded Matplotlib.
+- `src/simulations/geometry_inference.py`: dataset-driven geometry inference and pulse-axis estimation.
+- `src/simulations/particle_model.py`: current propagation and tracer-particle transport model.
+- `src/simulations/cdw_model.py`: CDW switching engine, replay calibration, and synthetic NetCDF export.
+- `src/simulations/simulation_app.py`: standalone simulator GUI.
 - `src/analysis/clustering_pipeline.ipynb`: original notebook reference for the clustering and sequence workflow.
 - `src/analysis/data_processing..ipynb`: original dataset inspection notebook.
