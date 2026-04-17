@@ -1,0 +1,1 @@
+Package for analyzing TaSe2 data. Plan to expand with updated simulation software for simulating critical current.
