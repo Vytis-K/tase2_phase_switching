@@ -50,6 +50,7 @@ class AnalysisApp:
         "Cluster sequence map",
         "Simple state map",
         "Simple state sequence map",
+        "State comparison",
     ]
 
     def __init__(self, root: tk.Tk, initial_files: list[str] | None = None) -> None:
@@ -649,12 +650,186 @@ class AnalysisApp:
                 title="Most common per-pixel simple-state sequences",
             )
 
+        elif view == "State comparison":
+            from_index = self._current_compare_index(self.compare_from_var.get(), fallback=0)
+            to_index = self._current_compare_index(self.compare_to_var.get(), fallback=min(1, self.result.n_states - 1))
+            self._plot_comparison_view(from_index, to_index)
+
         else:
             axis = self.main_figure.add_subplot(111)
             axis.text(0.5, 0.5, f"Unsupported view: {view}", ha="center", va="center")
             axis.set_axis_off()
 
         self.main_canvas.draw_idle()
+
+    def _infer_opposite_pair(self, from_index: int, to_index: int) -> tuple[int, int] | None:
+        assert self.result is not None
+        n = self.result.n_states
+        if n == 2:
+            return (to_index, from_index)
+        if n == 4:
+            remaining = sorted({0, 1, 2, 3} - {from_index, to_index})
+            if len(remaining) == 2:
+                return (remaining[0], remaining[1])
+        return None
+
+    def _compute_state_boundaries(self, code_map: np.ndarray) -> np.ndarray:
+        boundary = np.zeros(code_map.shape, dtype=bool)
+        for axis_index in [0, 1]:
+            shifted = np.roll(code_map, -1, axis=axis_index)
+            diff = (code_map != shifted) & (code_map >= 0) & (shifted >= 0)
+            boundary |= diff
+            boundary |= np.roll(diff, 1, axis=axis_index)
+        assert self.result is not None
+        return boundary & self.result.valid_mask
+
+    def _plot_comparison_view(self, from_index: int, to_index: int) -> None:
+        from matplotlib.lines import Line2D
+
+        assert self.result is not None
+        r = self.result
+
+        n_simple = len(SIMPLE_STATE_NAMES)
+        state_cmap = mcolors.ListedColormap([SIMPLE_STATE_COLORS[name] for name in SIMPLE_STATE_NAMES])
+        state_cmap.set_bad(color="lightgray")
+        state_norm = mcolors.BoundaryNorm(np.arange(-0.5, n_simple + 0.5, 1), state_cmap.N)
+        state_short = ["I", "X", "M"]
+
+        transition_labels = [
+            "I \u2192 I", "I \u2192 X", "I \u2192 M",
+            "X \u2192 I", "X \u2192 X", "X \u2192 M",
+            "M \u2192 I", "M \u2192 X", "M \u2192 M",
+        ]
+        transition_colors = [
+            "#1f3b73",  # I→I stable insulating
+            "#6fa8dc",  # I→X
+            "#ff6600",  # I→M strong warming
+            "#a4c2f4",  # X→I
+            "#aaaaaa",  # X→X stable intermediate
+            "#ff9900",  # X→M
+            "#0a42a8",  # M→I strong cooling
+            "#6d9eeb",  # M→X
+            "#d62728",  # M→M stable metallic
+        ]
+        trans_cmap = mcolors.ListedColormap(transition_colors)
+        trans_cmap.set_bad(color="lightgray")
+        trans_norm = mcolors.BoundaryNorm(np.arange(-0.5, 9.5, 1), trans_cmap.N)
+
+        def make_transition_map(fi: int, ti: int) -> tuple[np.ndarray, np.ndarray]:
+            fc = r.simple_state_code_maps[fi]
+            tc = r.simple_state_code_maps[ti]
+            raw = np.full(fc.shape, fill_value=-1, dtype=int)
+            valid = r.valid_mask & (fc >= 0) & (tc >= 0)
+            raw[valid] = fc[valid] * 3 + tc[valid]
+            display = raw.astype(float)
+            display[~r.valid_mask] = np.nan
+            return raw, display
+
+        def make_stat_matrix(raw: np.ndarray) -> np.ndarray:
+            mat = np.zeros((3, 3), dtype=int)
+            for f in range(3):
+                for t in range(3):
+                    mat[f, t] = int(np.sum(raw == f * 3 + t))
+            return mat
+
+        from_map = r.simple_state_code_maps[from_index].astype(float).copy()
+        to_map = r.simple_state_code_maps[to_index].astype(float).copy()
+        from_map[~r.valid_mask] = np.nan
+        to_map[~r.valid_mask] = np.nan
+
+        trans_raw, trans_display = make_transition_map(from_index, to_index)
+        stat_matrix = make_stat_matrix(trans_raw)
+        from_boundary = self._compute_state_boundaries(r.simple_state_code_maps[from_index])
+        to_boundary = self._compute_state_boundaries(r.simple_state_code_maps[to_index])
+        opp = self._infer_opposite_pair(from_index, to_index)
+
+        axes = self.main_figure.subplots(2, 3)
+
+        # [0,0] Before state map
+        ax = axes[0, 0]
+        img = ax.imshow(from_map.T, origin="lower", cmap=state_cmap, norm=state_norm, aspect="auto")
+        ax.set_title(f"Before: {r.state_names[from_index]}")
+        ax.set_xlabel("x index")
+        ax.set_ylabel("y index")
+        cbar = self.main_figure.colorbar(img, ax=ax, fraction=0.046, pad=0.04, ticks=np.arange(n_simple))
+        cbar.ax.set_yticklabels(state_short)
+        self._mark_selected_pixel(ax)
+
+        # [0,1] After state map
+        ax = axes[0, 1]
+        img = ax.imshow(to_map.T, origin="lower", cmap=state_cmap, norm=state_norm, aspect="auto")
+        ax.set_title(f"After: {r.state_names[to_index]}")
+        ax.set_xlabel("x index")
+        ax.set_ylabel("y index")
+        cbar = self.main_figure.colorbar(img, ax=ax, fraction=0.046, pad=0.04, ticks=np.arange(n_simple))
+        cbar.ax.set_yticklabels(state_short)
+        self._mark_selected_pixel(ax)
+
+        # [0,2] Transition map
+        ax = axes[0, 2]
+        img = ax.imshow(trans_display.T, origin="lower", cmap=trans_cmap, norm=trans_norm, aspect="auto")
+        ax.set_title(f"Transition map\n{r.state_names[from_index]} \u2192 {r.state_names[to_index]}")
+        ax.set_xlabel("x index")
+        ax.set_ylabel("y index")
+        cbar = self.main_figure.colorbar(img, ax=ax, fraction=0.046, pad=0.04, ticks=np.arange(9))
+        cbar.ax.set_yticklabels(transition_labels, fontsize=7)
+        self._mark_selected_pixel(ax)
+
+        # [1,0] Boundary overlay
+        ax = axes[1, 0]
+        ax.imshow(r.average_normalized_total_map.T, origin="lower", cmap="gray", aspect="auto")
+        fy, fx = np.where(from_boundary.T)
+        if len(fx):
+            ax.scatter(fx, fy, s=2, c="#00ccff", alpha=0.85, linewidths=0)
+        ty, tx = np.where(to_boundary.T)
+        if len(tx):
+            ax.scatter(tx, ty, s=2, c="#ff6600", alpha=0.85, linewidths=0)
+        legend_elements = [
+            Line2D([0], [0], marker="o", color="w", markerfacecolor="#00ccff", markersize=6, label=f"Before ({r.state_names[from_index]})"),
+            Line2D([0], [0], marker="o", color="w", markerfacecolor="#ff6600", markersize=6, label=f"After ({r.state_names[to_index]})"),
+        ]
+        ax.legend(handles=legend_elements, loc="lower right", fontsize=7)
+        ax.set_title("Boundary overlay")
+        ax.set_xlabel("x index")
+        ax.set_ylabel("y index")
+        self._mark_selected_pixel(ax)
+
+        # [1,1] Transition statistics matrix
+        ax = axes[1, 1]
+        vmax = max(1, int(stat_matrix.max()))
+        im = ax.imshow(stat_matrix, cmap="YlOrRd", aspect="auto", vmin=0, vmax=vmax)
+        ax.set_xticks([0, 1, 2])
+        ax.set_xticklabels(["\u2192 I", "\u2192 X", "\u2192 M"])
+        ax.set_yticks([0, 1, 2])
+        ax.set_yticklabels(["I \u2192", "X \u2192", "M \u2192"])
+        ax.set_title("Transition statistics\n(pixel counts)")
+        ax.set_xlabel("To state")
+        ax.set_ylabel("From state")
+        for (row, col), count in np.ndenumerate(stat_matrix):
+            text_color = "white" if count > vmax * 0.65 else "black"
+            ax.text(col, row, str(count), ha="center", va="center", fontsize=9, color=text_color)
+        self.main_figure.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+        # [1,2] Opposite direction transition map
+        ax = axes[1, 2]
+        if opp is not None:
+            opp_from, opp_to = opp
+            _, opp_display = make_transition_map(opp_from, opp_to)
+            opp_raw, _ = make_transition_map(opp_from, opp_to)
+            img = ax.imshow(opp_display.T, origin="lower", cmap=trans_cmap, norm=trans_norm, aspect="auto")
+            ax.set_title(f"Opposite direction\n{r.state_names[opp_from]} \u2192 {r.state_names[opp_to]}")
+            ax.set_xlabel("x index")
+            ax.set_ylabel("y index")
+            cbar = self.main_figure.colorbar(img, ax=ax, fraction=0.046, pad=0.04, ticks=np.arange(9))
+            cbar.ax.set_yticklabels(transition_labels, fontsize=7)
+            self._mark_selected_pixel(ax)
+        else:
+            ax.text(
+                0.5, 0.5,
+                "Opposite direction unavailable.\nLoad exactly 2 or 4 states to enable.",
+                ha="center", va="center", fontsize=10, transform=ax.transAxes,
+            )
+            ax.set_axis_off()
 
     def _plot_sequence_map(
         self,
