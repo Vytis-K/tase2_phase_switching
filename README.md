@@ -10,6 +10,10 @@ Desktop analysis tooling for TaSe2 phase-switching datasets, with the notebook w
 - Runs shared PCA and k-means clustering so you can compare spectral classes across multiple pulse states.
 - Builds simple state maps and per-pixel sequence maps to show how pixels switch between states over time.
 - Lets you click any pixel to inspect its local spectrum across the full sequence.
+- Includes a dedicated Clustering panel with low/medium/high resource methods, popup interpretation views, and CSV exports for physical cluster comparisons.
+- Adds an Initial-State Changes panel for loading longer file sequences, labeling the initial file, reordering states, and viewing energy-profile deltas against that initial state.
+- Adds an EDC/MDC Compare panel for two-file pixel-map overlays, point-level EDC/MDC curves, waterfall views, and second-minus-first differences.
+- Adds a Feature Search panel that ranks special two-dataset changes and includes a placeholder AI data-analysis button for a future Ollama hook.
 - Exports the analysis outputs as `.json` summaries and `.npy` arrays.
 
 ## What the simulator does

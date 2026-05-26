@@ -19,6 +19,8 @@ dependencies = [
 [project.scripts]
 tase2-desktop = "tase2_phase_switching.desktop_app:main"
 tase2-simulator = "simulations.simulation_app:main"
+tase2-build-switching-ml-dataset = "tase2_phase_switching.ml_switching_dataset:main"
+tase2-train-switching-predictor = "tase2_phase_switching.ml_switching_train:main"
 
 [tool.setuptools.package-dir]
 "" = "src"
