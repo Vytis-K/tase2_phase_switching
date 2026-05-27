@@ -4,7 +4,7 @@ Desktop analysis tooling for TaSe2 phase-switching datasets, with the notebook w
 
 ## What the app does
 
-- Loads 1 to 4 NetCDF datasets in sequence order.
+- Loads 1 to 4 ARPES datasets in sequence order from NetCDF, long-form table (`.csv`/`.tsv`/`.txt`/`.dat`), or NumPy (`.npy`/`.npz`) files.
 - Detects the cross-shaped contact region automatically from the spatial intensity maps.
 - Extracts per-pixel spectral features near the Fermi level and across the full local spectrum.
 - Runs shared PCA and k-means clustering so you can compare spectral classes across multiple pulse states.
@@ -14,6 +14,7 @@ Desktop analysis tooling for TaSe2 phase-switching datasets, with the notebook w
 - Adds an Initial-State Changes panel for loading longer file sequences, labeling the initial file, reordering states, and viewing energy-profile deltas against that initial state.
 - Adds an EDC/MDC Compare panel for two-file pixel-map overlays, point-level EDC/MDC curves, waterfall views, and second-minus-first differences.
 - Adds a Feature Search panel that ranks special two-dataset changes and includes a placeholder AI data-analysis button for a future Ollama hook.
+- Adds a Topography Map view for overlaying a SEM `.tif`/`.tiff` image on an ARPES intensity or feature map.
 - Exports the analysis outputs as `.json` summaries and `.npy` arrays.
 
 ## What the simulator does

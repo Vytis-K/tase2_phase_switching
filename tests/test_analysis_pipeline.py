@@ -38,6 +38,9 @@ from tase2_phase_switching.analysis import (
     export_transition_outcome_maps,
     initial_state_feature_rows,
     initial_transition_metric_rows,
+    load_state,
+    load_topography_image,
+    resample_spatial_map,
     run_analysis,
     run_initial_transition_feature_analysis,
     run_switching_mechanism_diagnostics,
@@ -146,6 +149,51 @@ def build_cropped_dataset(source_path: Path, output_path: Path, x_slice: slice, 
     return output_path
 
 
+def build_tabular_arpes_export(path: Path, state_index: int) -> Path:
+    x = np.arange(8, dtype=np.float32)
+    y = np.arange(7, dtype=np.float32)
+    energy = np.linspace(-0.20, 0.12, 10, dtype=np.float32)
+    phi = np.linspace(-0.8, 0.8, 6, dtype=np.float32)
+    energy_grid, phi_grid = np.meshgrid(energy, phi, indexing="ij")
+
+    spectral_peak = np.exp(-((energy_grid + 0.08 - 0.02 * state_index) / 0.08) ** 2)
+    near_ef = 0.35 * np.exp(-(energy_grid / 0.045) ** 2) * np.exp(-(phi_grid / 0.35) ** 2)
+    basis = (spectral_peak + state_index * 0.18 * near_ef).astype(np.float32)
+
+    x_mid = x.size // 2
+    y_mid = y.size // 2
+    cross = (np.abs(x[:, None] - x_mid) <= 1) | (np.abs(y[None, :] - y_mid) <= 1)
+    amplitude = 0.25 + 0.8 * cross.astype(np.float32) + 0.05 * state_index * x[:, None]
+    cube = amplitude[:, :, None, None] * basis[None, None, :, :]
+
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write("x_um,y_um,energy_eV,phi_deg,counts\n")
+        for xi, x_value in enumerate(x):
+            for yi, y_value in enumerate(y):
+                for ei, e_value in enumerate(energy):
+                    for pi, phi_value in enumerate(phi):
+                        handle.write(
+                            f"{float(x_value):.6g},{float(y_value):.6g},{float(e_value):.8g},"
+                            f"{float(phi_value):.8g},{float(cube[xi, yi, ei, pi]):.8g}\n"
+                        )
+    return path
+
+
+def build_grouped_hirotaka_style_dataset(path: Path) -> Path:
+    y = np.linspace(-2.0, 2.0, 5, dtype=np.float32)
+    x = np.linspace(-3.0, 3.0, 4, dtype=np.float32)
+    kp = np.linspace(-0.6, 0.6, 7, dtype=np.float32)
+    energy = np.linspace(-0.2, 0.1, 6, dtype=np.float32)
+    yy, xx, kk, ee = np.meshgrid(y, x, kp, energy, indexing="ij")
+    cube = (1.0 + 0.1 * xx + 0.2 * yy + np.exp(-((ee + 0.05) / 0.08) ** 2) * (1.0 + kk)).astype(np.float32)
+    dataset = xr.Dataset(
+        {"spectrum_filtered_converted": (("y", "x", "kp", "eV"), cube)},
+        coords={"y": y, "x": x, "kp": kp, "eV": energy},
+    )
+    dataset.to_netcdf(path, engine="h5netcdf", group="item_0")
+    return path
+
+
 class AnalysisPipelineTest(unittest.TestCase):
     def test_pipeline_and_export(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -205,6 +253,61 @@ class AnalysisPipelineTest(unittest.TestCase):
             self.assertEqual(result.loaded_states[1].data_array.shape[:2], (11, 11))
             self.assertTrue(any("Spatially aligned files" in note for note in result.notes))
             self.assertTrue(any("state_full.nc" in note and "x=4:15" in note and "y=3:14" in note for note in result.notes))
+
+    def test_pipeline_loads_long_form_csv_exports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            files = [
+                build_tabular_arpes_export(tmp_path / f"state_{index}.csv", state_index=index)
+                for index in range(2)
+            ]
+
+            loaded = load_state(str(files[0]))
+            self.assertEqual(loaded.data_array.dims, ("x", "y", "eV", "phi"))
+            self.assertEqual(loaded.data_array.shape, (8, 7, 10, 6))
+
+            result = run_analysis(
+                [str(path) for path in files],
+                AnalysisParameters(
+                    n_clusters=3,
+                    n_pca_components=2,
+                    cross_threshold_quantile=0.35,
+                    cross_row_fraction=0.12,
+                    cross_col_fraction=0.12,
+                ),
+            )
+
+            self.assertEqual(result.n_states, 2)
+            self.assertEqual(result.shape, (8, 7))
+            self.assertGreater(int(result.valid_mask.sum()), 0)
+
+    def test_loads_grouped_hirotaka_style_netcdf(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_path = build_grouped_hirotaka_style_dataset(Path(tmpdir) / "hirotaka_style.nc")
+
+            loaded = load_state(str(file_path))
+
+            self.assertEqual(loaded.data_array.dims, ("x", "y", "eV", "phi"))
+            self.assertEqual(loaded.data_array.shape, (4, 5, 6, 7))
+            self.assertTrue(np.allclose(loaded.data_array.coords["phi"].values, np.linspace(-0.6, 0.6, 7)))
+
+    def test_loads_and_resamples_sem_tiff_topography(self) -> None:
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow is not installed.")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            tif_path = tmp_path / "sem_topography.tif"
+            source = (np.arange(35, dtype=np.uint16).reshape(5, 7) * 17).astype(np.uint16)
+            Image.fromarray(source).save(tif_path)
+
+            image = load_topography_image(str(tif_path))
+            self.assertEqual(image.shape, source.shape)
+            resampled = resample_spatial_map(image, (8, 6), order=1)
+            self.assertEqual(resampled.shape, (8, 6))
+            self.assertTrue(np.isfinite(resampled).all())
 
     def test_spectral_cluster_probe(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

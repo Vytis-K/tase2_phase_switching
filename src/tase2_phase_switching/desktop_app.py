@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import json
 import os
 from pathlib import Path
 import queue
 import tempfile
 import threading
 import tkinter as tk
+import uuid
 from tkinter import filedialog, messagebox, ttk
 
 os.environ.setdefault(
@@ -69,7 +72,9 @@ from .analysis import (
     export_state_prediction,
     export_switching_map,
     export_transition_outcome_maps,
+    load_topography_image,
     load_state,
+    resample_spatial_map,
     run_analysis,
     run_initial_transition_feature_analysis,
     run_switching_mechanism_diagnostics,
@@ -78,12 +83,32 @@ from .analysis import (
     run_state_prediction,
     run_switching_map,
     run_transition_outcome_maps,
+    robust_normalize_map,
     total_and_ef_maps,
 )
 
 
 FILE_TYPES = [
+    ("ARPES data files", "*.nc *.nc4 *.h5 *.hdf5 *.csv *.tsv *.txt *.dat *.npy *.npz"),
     ("NetCDF files", "*.nc *.nc4 *.h5 *.hdf5"),
+    ("Table files", "*.csv *.tsv *.txt *.dat"),
+    ("NumPy files", "*.npy *.npz"),
+    ("All files", "*.*"),
+]
+
+SEM_FILE_TYPES = [
+    ("SEM TIFF images", "*.tif *.tiff"),
+    ("All files", "*.*"),
+]
+UPLOAD_FILE_TYPES = [
+    ("ARPES and SEM files", "*.nc *.nc4 *.h5 *.hdf5 *.csv *.tsv *.txt *.dat *.npy *.npz *.tif *.tiff"),
+    *FILE_TYPES[:-1],
+    *SEM_FILE_TYPES[:-1],
+    ("All files", "*.*"),
+]
+TOPOGRAPHY_EXTENSIONS = {".tif", ".tiff"}
+JUPYTER_NOTEBOOK_FILE_TYPES = [
+    ("Jupyter notebooks", "*.ipynb"),
     ("All files", "*.*"),
 ]
 
@@ -121,6 +146,7 @@ class AnalysisApp:
         "Mask occupancy diagnostics",
         "Total intensity",
         "Near-EF intensity",
+        "Topography Map",
         "Feature map",
         "Delta feature",
         "Cluster map",
@@ -129,6 +155,13 @@ class AnalysisApp:
         "Simple state sequence map",
         "State comparison",
     ]
+    TOPOGRAPHY_BASE_OPTIONS = [
+        "Near-EF intensity",
+        "Total intensity",
+        "Feature map",
+        "Average normalized total map",
+    ]
+    TOPOGRAPHY_ROTATION_OPTIONS = ["0", "90", "180", "270"]
     CLUSTER_COLOR_OPTIONS = {
         "Cluster label": "cluster",
         "Near-EF fraction": "ef_fraction",
@@ -341,6 +374,15 @@ class AnalysisApp:
         self.mechanism_file_paths: list[str] = []
         self.mechanism_worker_thread: threading.Thread | None = None
         self.mechanism_worker_queue: queue.Queue[tuple[str, object]] | None = None
+        self.topography_file_path: str | None = None
+        self.topography_cache_path: str | None = None
+        self.topography_cache_image: np.ndarray | None = None
+        self.notebook_file_paths: list[str] = []
+        self.notebook_path: str | None = None
+        self.notebook_data: dict[str, object] | None = None
+        self.notebook_selected_cell_index: int | None = None
+        self.notebook_output_images: list[tk.PhotoImage] = []
+        self.notebook_modified = False
 
         defaults = AnalysisParameters()
         self.parameter_vars = {
@@ -364,9 +406,9 @@ class AnalysisApp:
         }
 
         self.status_var = tk.StringVar(
-            value="Choose 1 to 4 NetCDF files, adjust the analysis parameters, then run the pipeline."
+            value="Choose 1 to 4 data files, adjust the analysis parameters, then run the pipeline."
         )
-        self.upload_status_var = tk.StringVar(value="Choose the NetCDF files to analyze.")
+        self.upload_status_var = tk.StringVar(value="Choose the data files to analyze.")
         self.global_progress_var = tk.DoubleVar(value=0.0)
         self.global_progress_status_var = tk.StringVar(value="Ready.")
         self.runner_panel_var = tk.StringVar(value=self.ANALYSIS_PANEL_OPTIONS[0])
@@ -377,13 +419,23 @@ class AnalysisApp:
             value="Run the main analysis, then use the Clustering panel to cluster registered spectra."
         )
         self.sequence_status_var = tk.StringVar(
-            value="Add NetCDF files in sequence order, choose a map, then load the sequence viewer."
+            value="Add data files in sequence order, choose a map, then load the sequence viewer."
         )
         self.view_var = tk.StringVar(value=self.VIEW_OPTIONS[0])
         self.state_var = tk.StringVar(value="")
         self.feature_var = tk.StringVar(value="")
         self.compare_from_var = tk.StringVar(value="")
         self.compare_to_var = tk.StringVar(value="")
+        self.topography_file_var = tk.StringVar(value="")
+        self.topography_base_var = tk.StringVar(value=self.TOPOGRAPHY_BASE_OPTIONS[0])
+        self.topography_alpha_var = tk.DoubleVar(value=0.45)
+        self.topography_rotation_var = tk.StringVar(value=self.TOPOGRAPHY_ROTATION_OPTIONS[0])
+        self.topography_flip_x_var = tk.BooleanVar(value=False)
+        self.topography_flip_y_var = tk.BooleanVar(value=False)
+        self.notebook_status_var = tk.StringVar(
+            value="Add a .ipynb file to view cells, edit code, run it, and save changes."
+        )
+        self.notebook_cell_title_var = tk.StringVar(value="No notebook loaded")
         self.cluster_state_var = tk.StringVar(value="")
         self.cluster_method_var = tk.StringVar(value=SPECTRAL_CLUSTER_METHOD_LABELS[cluster_defaults.method_key])
         self.cluster_color_var = tk.StringVar(value="Near-EF fraction")
@@ -394,7 +446,7 @@ class AnalysisApp:
             "ef_window_ev": tk.StringVar(value=str(defaults.ef_window_ev)),
         }
         self.change_status_var = tk.StringVar(
-            value="Add NetCDF files, label the initial state, then run the initial-state change view."
+            value="Add data files, label the initial state, then run the initial-state change view."
         )
         self.change_initial_var = tk.StringVar(value="")
         self.change_target_var = tk.StringVar(value="")
@@ -405,7 +457,7 @@ class AnalysisApp:
             "wide_window_ev": tk.StringVar(value=str(defaults.wide_window_ev)),
         }
         self.curve_status_var = tk.StringVar(
-            value="Add at least two NetCDF files, choose a pair, then run the EDC/MDC comparison."
+            value="Add at least two data files, choose a pair, then run the EDC/MDC comparison."
         )
         self.curve_first_var = tk.StringVar(value="")
         self.curve_second_var = tk.StringVar(value="")
@@ -416,7 +468,7 @@ class AnalysisApp:
             "ef_window_ev": tk.StringVar(value=str(defaults.ef_window_ev)),
         }
         self.feature_status_var = tk.StringVar(
-            value="Add at least two NetCDF files, choose a pair, then search for special features."
+            value="Add at least two data files, choose a pair, then search for special features."
         )
         self.feature_first_var = tk.StringVar(value="")
         self.feature_second_var = tk.StringVar(value="")
@@ -429,7 +481,7 @@ class AnalysisApp:
         }
         classifier_defaults = StateClassifierParameters()
         self.classifier_status_var = tk.StringVar(
-            value="Choose one NetCDF file, set feature windows, then compute rule-based clustering labels."
+            value="Choose one data file, set feature windows, then compute rule-based clustering labels."
         )
         self.classifier_file_var = tk.StringVar(value="")
         self.classifier_map_var = tk.StringVar(value="Classified state")
@@ -453,7 +505,7 @@ class AnalysisApp:
         }
         switching_defaults = SwitchingMapParameters()
         self.switching_status_var = tk.StringVar(
-            value="Add chronological NetCDF files, tune EF/LHB windows, then compute switching sites."
+            value="Add chronological data files, tune EF/LHB windows, then compute switching sites."
         )
         self.switching_parameter_vars = {
             "fermi_level_ev": tk.StringVar(value=str(switching_defaults.fermi_level_ev)),
@@ -470,7 +522,7 @@ class AnalysisApp:
         }
         state_prediction_defaults = StatePredictionParameters()
         self.state_prediction_status_var = tk.StringVar(
-            value="Add chronological NetCDF files, then compare future switching to initial-state features."
+            value="Add chronological data files, then compare future switching to initial-state features."
         )
         self.state_prediction_parameter_vars = {
             "fermi_level_ev": tk.StringVar(value=str(state_prediction_defaults.fermi_level_ev)),
@@ -494,7 +546,7 @@ class AnalysisApp:
         }
         transition_defaults = TransitionOutcomeParameters()
         self.transition_outcome_status_var = tk.StringVar(
-            value="Add chronological NetCDF files to map written and erased pixels for each transition."
+            value="Add chronological data files to map written and erased pixels for each transition."
         )
         self.transition_outcome_pulse_labels_var = tk.StringVar(value="")
         self.transition_outcome_show_wef_var = tk.BooleanVar(value=False)
@@ -562,7 +614,10 @@ class AnalysisApp:
         self._build_ui()
 
         if initial_files:
-            if self.upload_first:
+            initial_files = self._extract_topography_files(initial_files)
+            if not initial_files:
+                pass
+            elif self.upload_first:
                 self._set_uploaded_files(initial_files)
             else:
                 self._set_files(initial_files)
@@ -588,6 +643,7 @@ class AnalysisApp:
         self._render_transition_outcome_placeholder()
         self._render_initial_transition_placeholder()
         self._render_mechanism_placeholder()
+        self._render_notebook_placeholder()
 
     def _build_ui(self) -> None:
         if self.upload_first:
@@ -650,11 +706,19 @@ class AnalysisApp:
         self.top_notebook.add(mechanism_frame, text="Switching Mechanism Diagnostics")
         self._build_switching_mechanism_panel(mechanism_frame)
 
+        jupyter_frame = ttk.Frame(self.top_notebook)
+        self.top_notebook.add(jupyter_frame, text="Jupyter notebooks")
+        self._build_jupyter_notebooks_panel(jupyter_frame)
+
         if self.upload_first:
             footer = ttk.Frame(self.root, padding=(10, 6))
             footer.pack(fill=tk.X)
             ttk.Button(footer, text="Files", command=self._show_upload_gate, width=10).pack(side=tk.LEFT)
             ttk.Button(footer, text="Run", command=self._show_runner_gate, width=10).pack(side=tk.LEFT, padx=(6, 0))
+            ttk.Button(footer, text="Notebooks", command=self._open_jupyter_notebooks_view, width=12).pack(
+                side=tk.LEFT,
+                padx=(6, 0),
+            )
             ttk.Label(footer, textvariable=self.status_var, anchor="w", padding=(10, 0)).pack(
                 side=tk.LEFT,
                 fill=tk.X,
@@ -692,7 +756,7 @@ class AnalysisApp:
             wraplength=1100,
         ).grid(row=1, column=0, sticky="ew", pady=(8, 0))
 
-        files_frame = ttk.LabelFrame(parent, text="NetCDF Files", padding=12)
+        files_frame = ttk.LabelFrame(parent, text="Data Files", padding=12)
         files_frame.grid(row=1, column=0, sticky="nsew")
         files_frame.columnconfigure(0, weight=1)
         files_frame.rowconfigure(0, weight=1)
@@ -815,11 +879,24 @@ class AnalysisApp:
             seen.add(resolved)
         return normalized
 
+    def _extract_topography_files(self, file_paths: list[str]) -> list[str]:
+        data_paths: list[str] = []
+        topography_paths: list[str] = []
+        for path in self._normalize_file_paths(file_paths):
+            if Path(path).suffix.lower() in TOPOGRAPHY_EXTENSIONS:
+                topography_paths.append(path)
+            else:
+                data_paths.append(path)
+        if topography_paths:
+            self._set_topography_file(topography_paths[-1])
+            self.status_var.set(f"Loaded SEM topography file: {Path(topography_paths[-1]).name}")
+        return data_paths
+
     def _add_uploaded_files(self) -> None:
-        selected = list(filedialog.askopenfilenames(title="Choose NetCDF files", filetypes=FILE_TYPES))
+        selected = list(filedialog.askopenfilenames(title="Choose ARPES or SEM files", filetypes=UPLOAD_FILE_TYPES))
         if not selected:
             return
-        new_paths = self._normalize_file_paths(selected)
+        new_paths = self._extract_topography_files(selected)
         merged = self.uploaded_file_paths + [path for path in new_paths if path not in self.uploaded_file_paths]
         self._set_uploaded_files(merged)
 
@@ -829,7 +906,10 @@ class AnalysisApp:
             return
         updated_files = list(self.uploaded_file_paths)
         for index in reversed(selection):
-            del updated_files[index]
+            if index < len(updated_files):
+                del updated_files[index]
+            elif self.topography_file_path is not None:
+                self._clear_topography_file()
         self._set_uploaded_files(updated_files)
 
     def _move_selected_uploaded_file(self, direction: int) -> None:
@@ -837,6 +917,8 @@ class AnalysisApp:
         if len(selection) != 1:
             return
         index = selection[0]
+        if index >= len(self.uploaded_file_paths):
+            return
         new_index = index + direction
         if not 0 <= new_index < len(self.uploaded_file_paths):
             return
@@ -846,6 +928,7 @@ class AnalysisApp:
         self.upload_file_listbox.selection_set(new_index)
 
     def _clear_uploaded_files(self) -> None:
+        self._clear_topography_file()
         self._set_uploaded_files([])
 
     def _set_uploaded_files(self, file_paths: list[str]) -> None:
@@ -863,25 +946,32 @@ class AnalysisApp:
             return
         self.upload_file_listbox.delete(0, tk.END)
         for index, path in enumerate(self.uploaded_file_paths):
-            self.upload_file_listbox.insert(tk.END, f"{index + 1}. {Path(path).name}")
+            self.upload_file_listbox.insert(tk.END, f"{index + 1}. ARPES  {Path(path).name}")
+        if self.topography_file_path is not None:
+            self.upload_file_listbox.insert(tk.END, f"SEM. {Path(self.topography_file_path).name}")
 
     def _sync_runner_file_listbox(self) -> None:
         if not hasattr(self, "runner_file_listbox"):
             return
         self.runner_file_listbox.delete(0, tk.END)
         for index, path in enumerate(self.uploaded_file_paths):
-            self.runner_file_listbox.insert(tk.END, f"{index + 1}. {Path(path).name}")
+            self.runner_file_listbox.insert(tk.END, f"{index + 1}. ARPES  {Path(path).name}")
+        if self.topography_file_path is not None:
+            self.runner_file_listbox.insert(tk.END, f"SEM. {Path(self.topography_file_path).name}")
 
     def _update_upload_status(self) -> None:
         count = len(self.uploaded_file_paths)
+        sem_note = ""
+        if self.topography_file_path is not None:
+            sem_note = f" SEM topography loaded: {Path(self.topography_file_path).name}."
         if count == 0:
-            message = "Choose the NetCDF files to analyze. Sequence order is preserved for chronological views."
+            message = "Choose the data files to analyze. Sequence order is preserved for chronological views." + sem_note
         elif count <= 4:
-            message = f"{count} file(s) ready. Every view has been preloaded from this upload set."
+            message = f"{count} ARPES file(s) ready. Every view has been preloaded from this upload set.{sem_note}"
         else:
             message = (
-                f"{count} file(s) ready. Sequence views use all files; the main Analysis tab uses the first four, "
-                "and single-file/pair views use the first file or first two files."
+                f"{count} ARPES file(s) ready. Sequence views use all files; the main Analysis tab uses the first four, "
+                f"and single-file/pair views use the first file or first two files.{sem_note}"
             )
         self.upload_status_var.set(message)
         self.status_var.set(message)
@@ -906,7 +996,7 @@ class AnalysisApp:
 
     def _show_runner_gate(self) -> None:
         if not self.uploaded_file_paths:
-            messagebox.showinfo("No files uploaded", "Choose at least one NetCDF file before running an analysis panel.")
+            messagebox.showinfo("No files uploaded", "Choose at least one data file before running an analysis panel.")
             return
         self._apply_uploaded_files_to_views()
         if self.upload_frame.winfo_manager():
@@ -927,6 +1017,20 @@ class AnalysisApp:
         if not self.top_notebook.winfo_manager():
             self.top_notebook.pack(fill=tk.BOTH, expand=True)
         self.top_notebook.select(0)
+        self.global_progress_status_var.set("Ready.")
+
+    def _open_jupyter_notebooks_view(self) -> None:
+        if self.upload_first:
+            if self.upload_frame.winfo_manager():
+                self.upload_frame.pack_forget()
+            if self.runner_frame.winfo_manager():
+                self.runner_frame.pack_forget()
+        if not self.top_notebook.winfo_manager():
+            self.top_notebook.pack(fill=tk.BOTH, expand=True)
+        for index in range(self.top_notebook.index("end")):
+            if self.top_notebook.tab(index, "text") == "Jupyter notebooks":
+                self.top_notebook.select(index)
+                break
         self.global_progress_status_var.set("Ready.")
 
     def _show_upload_gate(self) -> None:
@@ -1096,14 +1200,68 @@ class AnalysisApp:
         main_pane = ttk.Panedwindow(parent, orient=tk.HORIZONTAL)
         main_pane.pack(fill=tk.BOTH, expand=True)
 
-        controls_frame = ttk.Frame(main_pane, padding=12)
+        controls_frame = self._build_analysis_controls_scroller(main_pane)
         main_pane.add(controls_frame, weight=0)
 
         right_frame = ttk.Frame(main_pane, padding=(0, 12, 12, 12))
         main_pane.add(right_frame, weight=1)
 
-        self._build_controls_panel(controls_frame)
+        self._build_controls_panel(self.analysis_controls_content)
         self._build_visual_panel(right_frame)
+
+    def _build_analysis_controls_scroller(self, parent: ttk.Panedwindow) -> ttk.Frame:
+        container = ttk.Frame(parent, padding=(12, 12, 6, 12))
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(0, weight=1)
+
+        self.analysis_controls_canvas = tk.Canvas(container, highlightthickness=0, width=380)
+        self.analysis_controls_scrollbar = ttk.Scrollbar(
+            container,
+            orient=tk.VERTICAL,
+            command=self.analysis_controls_canvas.yview,
+        )
+        self.analysis_controls_canvas.configure(yscrollcommand=self.analysis_controls_scrollbar.set)
+        self.analysis_controls_canvas.grid(row=0, column=0, sticky="nsew")
+        self.analysis_controls_scrollbar.grid(row=0, column=1, sticky="ns")
+
+        self.analysis_controls_content = ttk.Frame(self.analysis_controls_canvas)
+        self.analysis_controls_content.columnconfigure(0, weight=1)
+        self.analysis_controls_window = self.analysis_controls_canvas.create_window(
+            (0, 0),
+            window=self.analysis_controls_content,
+            anchor="nw",
+        )
+        self.analysis_controls_content.bind("<Configure>", self._update_analysis_controls_scroll_region)
+        self.analysis_controls_canvas.bind("<Configure>", self._resize_analysis_controls_window)
+        self.analysis_controls_canvas.bind("<Enter>", self._bind_analysis_controls_mousewheel)
+        self.analysis_controls_canvas.bind("<Leave>", self._unbind_analysis_controls_mousewheel)
+        self.analysis_controls_content.bind("<Enter>", self._bind_analysis_controls_mousewheel)
+        self.analysis_controls_content.bind("<Leave>", self._unbind_analysis_controls_mousewheel)
+        return container
+
+    def _update_analysis_controls_scroll_region(self, _event: tk.Event | None = None) -> None:
+        if hasattr(self, "analysis_controls_canvas"):
+            self.analysis_controls_canvas.configure(scrollregion=self.analysis_controls_canvas.bbox("all"))
+
+    def _resize_analysis_controls_window(self, event: tk.Event) -> None:
+        if not hasattr(self, "analysis_controls_window"):
+            return
+        self.analysis_controls_canvas.itemconfigure(
+            self.analysis_controls_window,
+            width=max(1, int(event.width)),
+        )
+
+    def _bind_analysis_controls_mousewheel(self, _event: tk.Event | None = None) -> None:
+        self.analysis_controls_canvas.bind_all("<MouseWheel>", self._on_analysis_controls_mousewheel)
+
+    def _unbind_analysis_controls_mousewheel(self, _event: tk.Event | None = None) -> None:
+        self.analysis_controls_canvas.unbind_all("<MouseWheel>")
+
+    def _on_analysis_controls_mousewheel(self, event: tk.Event) -> None:
+        delta = int(getattr(event, "delta", 0))
+        if delta == 0:
+            return
+        self.analysis_controls_canvas.yview_scroll(-1 if delta > 0 else 1, "units")
 
     def _build_sequence_panel(self, parent: ttk.Frame) -> None:
         main_pane = ttk.Panedwindow(parent, orient=tk.HORIZONTAL)
@@ -1234,6 +1392,176 @@ class AnalysisApp:
 
         self._build_switching_mechanism_controls_panel(controls_frame)
         self._build_switching_mechanism_visual_panel(right_frame)
+
+    def _build_jupyter_notebooks_panel(self, parent: ttk.Frame) -> None:
+        main_pane = ttk.Panedwindow(parent, orient=tk.HORIZONTAL)
+        main_pane.pack(fill=tk.BOTH, expand=True)
+
+        controls_frame = ttk.Frame(main_pane, padding=12)
+        main_pane.add(controls_frame, weight=0)
+
+        editor_frame = ttk.Frame(main_pane, padding=(0, 12, 12, 12))
+        main_pane.add(editor_frame, weight=1)
+
+        self._build_jupyter_notebook_controls_panel(controls_frame)
+        self._build_jupyter_notebook_editor_panel(editor_frame)
+
+    def _build_jupyter_notebook_controls_panel(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=2)
+
+        files_frame = ttk.LabelFrame(parent, text="Notebook Files", padding=10)
+        files_frame.grid(row=0, column=0, sticky="nsew")
+        files_frame.columnconfigure(0, weight=1)
+        files_frame.rowconfigure(0, weight=1)
+
+        self.notebook_file_listbox = tk.Listbox(files_frame, height=8, exportselection=False)
+        self.notebook_file_listbox.grid(row=0, column=0, columnspan=3, sticky="nsew")
+        self.notebook_file_listbox.bind("<<ListboxSelect>>", self._select_notebook_from_list)
+
+        ttk.Button(files_frame, text="Add Notebooks", command=self._add_notebook_files).grid(
+            row=1,
+            column=0,
+            sticky="ew",
+            pady=(8, 0),
+        )
+        ttk.Button(files_frame, text="Remove", command=self._remove_selected_notebooks).grid(
+            row=1,
+            column=1,
+            sticky="ew",
+            padx=(6, 0),
+            pady=(8, 0),
+        )
+        ttk.Button(files_frame, text="Clear", command=self._clear_notebooks).grid(
+            row=1,
+            column=2,
+            sticky="ew",
+            padx=(6, 0),
+            pady=(8, 0),
+        )
+
+        cells_frame = ttk.LabelFrame(parent, text="Cells", padding=10)
+        cells_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        cells_frame.columnconfigure(0, weight=1)
+        cells_frame.rowconfigure(0, weight=1)
+
+        self.notebook_cell_listbox = tk.Listbox(cells_frame, height=18, exportselection=False)
+        self.notebook_cell_listbox.grid(row=0, column=0, columnspan=3, sticky="nsew")
+        self.notebook_cell_listbox.bind("<<ListboxSelect>>", self._select_notebook_cell_from_list)
+
+        ttk.Button(cells_frame, text="Add Code Cell", command=lambda: self._add_notebook_cell("code")).grid(
+            row=1,
+            column=0,
+            sticky="ew",
+            pady=(8, 0),
+        )
+        ttk.Button(cells_frame, text="Add Markdown", command=lambda: self._add_notebook_cell("markdown")).grid(
+            row=1,
+            column=1,
+            sticky="ew",
+            padx=(6, 0),
+            pady=(8, 0),
+        )
+        ttk.Button(cells_frame, text="Delete Cell", command=self._delete_selected_notebook_cell).grid(
+            row=1,
+            column=2,
+            sticky="ew",
+            padx=(6, 0),
+            pady=(8, 0),
+        )
+
+        actions_frame = ttk.LabelFrame(parent, text="Actions", padding=10)
+        actions_frame.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        actions_frame.columnconfigure(0, weight=1)
+        actions_frame.columnconfigure(1, weight=1)
+
+        ttk.Button(actions_frame, text="Run Notebook", command=self._run_notebook).grid(
+            row=0,
+            column=0,
+            sticky="ew",
+        )
+        ttk.Button(actions_frame, text="Run Selected Cell", command=self._run_selected_notebook_cell).grid(
+            row=0,
+            column=1,
+            sticky="ew",
+            padx=(6, 0),
+        )
+        ttk.Button(actions_frame, text="Save Notebook", command=self._save_notebook).grid(
+            row=1,
+            column=0,
+            sticky="ew",
+            pady=(8, 0),
+        )
+        ttk.Button(actions_frame, text="Save As", command=self._save_notebook_as).grid(
+            row=1,
+            column=1,
+            sticky="ew",
+            padx=(6, 0),
+            pady=(8, 0),
+        )
+        ttk.Button(actions_frame, text="Reload From Disk", command=self._reload_notebook).grid(
+            row=2,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(8, 0),
+        )
+
+        ttk.Label(
+            parent,
+            textvariable=self.notebook_status_var,
+            justify=tk.LEFT,
+            wraplength=330,
+        ).grid(row=3, column=0, sticky="ew", pady=(10, 0))
+
+    def _build_jupyter_notebook_editor_panel(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=3)
+        parent.rowconfigure(3, weight=2)
+
+        ttk.Label(
+            parent,
+            textvariable=self.notebook_cell_title_var,
+            anchor="w",
+            font=("TkDefaultFont", 11, "bold"),
+        ).grid(row=0, column=0, sticky="ew")
+
+        source_frame = ttk.LabelFrame(parent, text="Cell Source", padding=8)
+        source_frame.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        source_frame.columnconfigure(0, weight=1)
+        source_frame.rowconfigure(0, weight=1)
+
+        self.notebook_source_text = tk.Text(source_frame, height=18, wrap="none", undo=True)
+        source_y_scroll = ttk.Scrollbar(source_frame, orient=tk.VERTICAL, command=self.notebook_source_text.yview)
+        source_x_scroll = ttk.Scrollbar(source_frame, orient=tk.HORIZONTAL, command=self.notebook_source_text.xview)
+        self.notebook_source_text.configure(
+            yscrollcommand=source_y_scroll.set,
+            xscrollcommand=source_x_scroll.set,
+        )
+        self.notebook_source_text.grid(row=0, column=0, sticky="nsew")
+        source_y_scroll.grid(row=0, column=1, sticky="ns")
+        source_x_scroll.grid(row=1, column=0, sticky="ew")
+        self.notebook_source_text.bind("<<Modified>>", self._on_notebook_source_modified)
+
+        ttk.Label(parent, text="Cell Output", anchor="w", font=("TkDefaultFont", 11, "bold")).grid(
+            row=2,
+            column=0,
+            sticky="ew",
+            pady=(12, 0),
+        )
+
+        output_frame = ttk.Frame(parent)
+        output_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
+        output_frame.columnconfigure(0, weight=1)
+        output_frame.rowconfigure(0, weight=1)
+
+        self.notebook_output_text = tk.Text(output_frame, height=12, wrap="word")
+        output_y_scroll = ttk.Scrollbar(output_frame, orient=tk.VERTICAL, command=self.notebook_output_text.yview)
+        self.notebook_output_text.configure(yscrollcommand=output_y_scroll.set)
+        self.notebook_output_text.grid(row=0, column=0, sticky="nsew")
+        output_y_scroll.grid(row=0, column=1, sticky="ns")
+        self.notebook_output_text.configure(state="disabled")
 
     def _build_sequence_controls_panel(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -3519,6 +3847,70 @@ class AnalysisApp:
         self._add_parameter_row(mask_frame, 5, "State low quantile", "simple_state_low_quantile")
         self._add_parameter_row(mask_frame, 6, "State high quantile", "simple_state_high_quantile")
 
+        topography_frame = ttk.LabelFrame(parent, text="Topography Map", padding=10)
+        topography_frame.grid(row=4, column=0, sticky="ew", pady=(12, 0))
+        topography_frame.columnconfigure(0, weight=1)
+        ttk.Entry(topography_frame, textvariable=self.topography_file_var, state="readonly", width=34).grid(
+            row=0,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+        )
+        ttk.Button(topography_frame, text="Choose SEM TIFF", command=self._choose_topography_file).grid(
+            row=1,
+            column=0,
+            sticky="ew",
+            pady=(8, 0),
+        )
+        ttk.Button(topography_frame, text="Clear SEM", command=self._clear_topography_file).grid(
+            row=1,
+            column=1,
+            sticky="ew",
+            padx=(8, 0),
+            pady=(8, 0),
+        )
+        ttk.Label(topography_frame, text="ARPES base").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.topography_base_combo = ttk.Combobox(
+            topography_frame,
+            textvariable=self.topography_base_var,
+            values=self.TOPOGRAPHY_BASE_OPTIONS,
+            state="readonly",
+            width=22,
+        )
+        self.topography_base_combo.grid(row=3, column=0, columnspan=2, sticky="ew")
+        self.topography_base_combo.bind("<<ComboboxSelected>>", lambda _event: self._refresh_main_plot())
+        ttk.Label(topography_frame, text="Overlay alpha").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ttk.Scale(
+            topography_frame,
+            variable=self.topography_alpha_var,
+            from_=0.0,
+            to=1.0,
+            orient=tk.HORIZONTAL,
+            command=lambda _value: self._refresh_main_plot() if self.view_var.get() == "Topography Map" else None,
+        ).grid(row=4, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
+        ttk.Label(topography_frame, text="Rotate").grid(row=5, column=0, sticky="w", pady=(8, 0))
+        self.topography_rotation_combo = ttk.Combobox(
+            topography_frame,
+            textvariable=self.topography_rotation_var,
+            values=self.TOPOGRAPHY_ROTATION_OPTIONS,
+            state="readonly",
+            width=8,
+        )
+        self.topography_rotation_combo.grid(row=5, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
+        self.topography_rotation_combo.bind("<<ComboboxSelected>>", lambda _event: self._refresh_main_plot())
+        ttk.Checkbutton(
+            topography_frame,
+            text="Flip X",
+            variable=self.topography_flip_x_var,
+            command=self._refresh_main_plot,
+        ).grid(row=6, column=0, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(
+            topography_frame,
+            text="Flip Y",
+            variable=self.topography_flip_y_var,
+            command=self._refresh_main_plot,
+        ).grid(row=6, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+
         actions_frame = ttk.LabelFrame(parent, text="Actions", padding=10)
         actions_frame.grid(row=3, column=0, sticky="ew", pady=(12, 0))
         actions_frame.columnconfigure(0, weight=1)
@@ -3532,7 +3924,7 @@ class AnalysisApp:
             "Use the file order to represent the pulse sequence you want to compare.\n"
             "Click any map to inspect that pixel's local spectrum across all states."
         )
-        ttk.Label(parent, text=help_text, justify=tk.LEFT, wraplength=320).grid(row=4, column=0, sticky="ew", pady=(12, 0))
+        ttk.Label(parent, text=help_text, justify=tk.LEFT, wraplength=320).grid(row=5, column=0, sticky="ew", pady=(12, 0))
 
     def _build_visual_panel(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -3724,13 +4116,560 @@ class AnalysisApp:
         self.cluster_text.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         self.cluster_text.configure(state="disabled")
 
+    def _render_notebook_placeholder(self) -> None:
+        if not hasattr(self, "notebook_source_text") or not hasattr(self, "notebook_output_text"):
+            return
+        self.notebook_cell_title_var.set("No notebook loaded")
+        self.notebook_source_text.configure(state="normal")
+        self.notebook_source_text.delete("1.0", tk.END)
+        self.notebook_source_text.configure(state="disabled")
+        self.notebook_source_text.edit_modified(False)
+        self.notebook_output_images = []
+        self._set_text_widget(
+            self.notebook_output_text,
+            "Add a Jupyter notebook to inspect its cells, edit source, run code, and save outputs.",
+        )
+
+    def _add_notebook_files(self) -> None:
+        selected = list(
+            filedialog.askopenfilenames(title="Choose Jupyter notebooks", filetypes=JUPYTER_NOTEBOOK_FILE_TYPES)
+        )
+        if not selected:
+            return
+        new_paths = [str(Path(path).expanduser().resolve()) for path in selected]
+        merged = self.notebook_file_paths + [path for path in new_paths if path not in self.notebook_file_paths]
+        self._set_notebook_files(merged)
+        if self.notebook_path is None and new_paths:
+            self._load_notebook_file(new_paths[0], confirm_unsaved=False)
+
+    def _set_notebook_files(self, paths: list[str]) -> None:
+        self.notebook_file_paths = list(paths)
+        self._sync_notebook_file_listbox()
+
+    def _sync_notebook_file_listbox(self) -> None:
+        if not hasattr(self, "notebook_file_listbox"):
+            return
+        self.notebook_file_listbox.delete(0, tk.END)
+        for index, path in enumerate(self.notebook_file_paths, start=1):
+            self.notebook_file_listbox.insert(tk.END, f"{index}. {Path(path).name}")
+        if self.notebook_path in self.notebook_file_paths:
+            selected_index = self.notebook_file_paths.index(self.notebook_path)
+            self.notebook_file_listbox.selection_set(selected_index)
+            self.notebook_file_listbox.see(selected_index)
+
+    def _sync_notebook_cell_listbox(self) -> None:
+        if not hasattr(self, "notebook_cell_listbox"):
+            return
+        self.notebook_cell_listbox.delete(0, tk.END)
+        for index, cell in enumerate(self._notebook_cells()):
+            self.notebook_cell_listbox.insert(tk.END, self._notebook_cell_summary(index, cell))
+        if self.notebook_selected_cell_index is not None:
+            if 0 <= self.notebook_selected_cell_index < self.notebook_cell_listbox.size():
+                self.notebook_cell_listbox.selection_set(self.notebook_selected_cell_index)
+                self.notebook_cell_listbox.see(self.notebook_selected_cell_index)
+
+    def _select_notebook_from_list(self, _event: tk.Event | None = None) -> None:
+        selection = self.notebook_file_listbox.curselection()
+        if not selection:
+            return
+        index = int(selection[0])
+        if index >= len(self.notebook_file_paths):
+            return
+        path = self.notebook_file_paths[index]
+        if path == self.notebook_path:
+            return
+        self._load_notebook_file(path)
+
+    def _select_notebook_cell_from_list(self, _event: tk.Event | None = None) -> None:
+        selection = self.notebook_cell_listbox.curselection()
+        if not selection:
+            return
+        index = int(selection[0])
+        if index == self.notebook_selected_cell_index:
+            return
+        self._commit_notebook_editor_cell()
+        self.notebook_selected_cell_index = index
+        self._refresh_notebook_editor()
+
+    def _load_notebook_file(self, path: str, confirm_unsaved: bool = True) -> None:
+        if confirm_unsaved and not self._confirm_notebook_changes():
+            self._sync_notebook_file_listbox()
+            return
+        notebook_path = str(Path(path).expanduser().resolve())
+        try:
+            with open(notebook_path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception as exc:
+            messagebox.showerror("Notebook load failed", str(exc))
+            return
+
+        if not isinstance(data, dict) or not isinstance(data.get("cells"), list):
+            messagebox.showerror("Invalid notebook", "This file does not look like a valid Jupyter notebook.")
+            return
+
+        self.notebook_path = notebook_path
+        self.notebook_data = data
+        self.notebook_modified = False
+        self.notebook_selected_cell_index = 0 if self._notebook_cells() else None
+        if notebook_path not in self.notebook_file_paths:
+            self.notebook_file_paths.append(notebook_path)
+        self._sync_notebook_file_listbox()
+        self._sync_notebook_cell_listbox()
+        self._refresh_notebook_editor()
+        self._refresh_notebook_status()
+
+    def _clear_loaded_notebook(self) -> None:
+        self.notebook_path = None
+        self.notebook_data = None
+        self.notebook_selected_cell_index = None
+        self.notebook_modified = False
+        self._sync_notebook_file_listbox()
+        self._sync_notebook_cell_listbox()
+        self._render_notebook_placeholder()
+        self._refresh_notebook_status()
+
+    def _confirm_notebook_changes(self) -> bool:
+        self._commit_notebook_editor_cell()
+        if not self.notebook_modified:
+            return True
+        name = Path(self.notebook_path).name if self.notebook_path else "this notebook"
+        answer = messagebox.askyesnocancel(
+            "Unsaved notebook",
+            f"Save changes to {name} before continuing?",
+        )
+        if answer is None:
+            return False
+        if answer:
+            return self._save_notebook()
+        return True
+
+    def _commit_notebook_editor_cell(self) -> None:
+        if self.notebook_data is None or self.notebook_selected_cell_index is None:
+            return
+        if not hasattr(self, "notebook_source_text"):
+            return
+        cells = self._notebook_cells()
+        if not 0 <= self.notebook_selected_cell_index < len(cells):
+            return
+        if str(self.notebook_source_text.cget("state")) == "disabled":
+            return
+        source = self.notebook_source_text.get("1.0", "end-1c")
+        cell = cells[self.notebook_selected_cell_index]
+        previous_source = self._notebook_source_to_text(cell.get("source", ""))
+        if source != previous_source:
+            cell["source"] = source
+            self.notebook_modified = True
+            self._refresh_notebook_status()
+
+    def _refresh_notebook_editor(self) -> None:
+        if self.notebook_data is None or self.notebook_selected_cell_index is None:
+            self._render_notebook_placeholder()
+            return
+        cells = self._notebook_cells()
+        if not 0 <= self.notebook_selected_cell_index < len(cells):
+            self.notebook_selected_cell_index = 0 if cells else None
+            if self.notebook_selected_cell_index is None:
+                self._render_notebook_placeholder()
+                return
+        cell = cells[self.notebook_selected_cell_index]
+        cell_type = str(cell.get("cell_type", "code"))
+        self.notebook_cell_title_var.set(
+            f"Cell {self.notebook_selected_cell_index + 1} of {len(cells)} - {cell_type}"
+        )
+        self.notebook_source_text.configure(state="normal")
+        self.notebook_source_text.delete("1.0", tk.END)
+        self.notebook_source_text.insert("1.0", self._notebook_source_to_text(cell.get("source", "")))
+        self.notebook_source_text.edit_modified(False)
+        self._render_notebook_cell_output_widget(cell)
+        self._sync_notebook_cell_listbox()
+
+    def _refresh_notebook_status(self, message: str | None = None) -> None:
+        if message is not None:
+            self.notebook_status_var.set(message)
+            return
+        if self.notebook_path is None:
+            self.notebook_status_var.set("Add a .ipynb file to view cells, edit code, run it, and save changes.")
+            return
+        modified_label = "modified" if self.notebook_modified else "saved"
+        self.notebook_status_var.set(
+            f"Loaded {Path(self.notebook_path).name} ({modified_label}); {len(self._notebook_cells())} cells."
+        )
+
+    def _on_notebook_source_modified(self, _event: tk.Event | None = None) -> None:
+        if not hasattr(self, "notebook_source_text"):
+            return
+        if not self.notebook_source_text.edit_modified():
+            return
+        self.notebook_source_text.edit_modified(False)
+        if self.notebook_data is None or self.notebook_selected_cell_index is None:
+            return
+        self.notebook_modified = True
+        self._refresh_notebook_status()
+
+    def _notebook_cells(self) -> list[dict[str, object]]:
+        if self.notebook_data is None:
+            return []
+        cells = self.notebook_data.get("cells", [])
+        return cells if isinstance(cells, list) else []
+
+    def _notebook_source_to_text(self, source: object) -> str:
+        if isinstance(source, list):
+            return "".join(str(part) for part in source)
+        if source is None:
+            return ""
+        return str(source)
+
+    def _notebook_output_value_to_text(self, value: object) -> str:
+        if isinstance(value, list):
+            return "".join(str(part) for part in value)
+        if isinstance(value, dict):
+            return json.dumps(value, indent=2, ensure_ascii=False)
+        if value is None:
+            return ""
+        return str(value)
+
+    def _format_notebook_cell_outputs(self, cell: dict[str, object]) -> str:
+        cell_type = str(cell.get("cell_type", "code"))
+        if cell_type == "markdown":
+            source = self._notebook_source_to_text(cell.get("source", "")).strip()
+            return source or "Markdown cell has no source."
+        if cell_type != "code":
+            return self._notebook_source_to_text(cell.get("source", "")).strip() or "This cell has no output."
+
+        outputs = cell.get("outputs", [])
+        if not isinstance(outputs, list) or not outputs:
+            return "No output yet."
+
+        blocks: list[str] = []
+        for output in outputs:
+            if not isinstance(output, dict):
+                continue
+            output_type = str(output.get("output_type", "output"))
+            if output_type == "stream":
+                stream_name = str(output.get("name", "stream"))
+                text = self._notebook_output_value_to_text(output.get("text", ""))
+                blocks.append(f"[{stream_name}]\n{text}".rstrip())
+            elif output_type in {"execute_result", "display_data"}:
+                data = output.get("data", {})
+                if isinstance(data, dict):
+                    if "text/plain" in data:
+                        blocks.append(self._notebook_output_value_to_text(data["text/plain"]).rstrip())
+                    elif "text/html" in data:
+                        blocks.append(self._notebook_output_value_to_text(data["text/html"]).rstrip())
+                    media_keys = [key for key in data if isinstance(key, str) and key.startswith("image/")]
+                    for media_key in media_keys:
+                        blocks.append(f"[{media_key} output is stored in the notebook file]")
+                else:
+                    blocks.append(self._notebook_output_value_to_text(data).rstrip())
+            elif output_type == "error":
+                ename = self._notebook_output_value_to_text(output.get("ename", "Error"))
+                evalue = self._notebook_output_value_to_text(output.get("evalue", ""))
+                traceback_text = self._notebook_output_value_to_text(output.get("traceback", ""))
+                blocks.append(f"{ename}: {evalue}\n{traceback_text}".rstrip())
+            else:
+                blocks.append(json.dumps(output, indent=2, ensure_ascii=False))
+
+        return "\n\n".join(block for block in blocks if block).strip() or "No text output."
+
+    def _render_notebook_cell_output_widget(self, cell: dict[str, object]) -> None:
+        self.notebook_output_text.configure(state="normal")
+        self.notebook_output_text.delete("1.0", tk.END)
+        self.notebook_output_images = []
+        text_output = self._format_notebook_cell_outputs(cell)
+        if text_output:
+            self.notebook_output_text.insert("1.0", text_output)
+
+        image_outputs = self._notebook_image_outputs(cell)
+        if image_outputs:
+            if text_output:
+                self.notebook_output_text.insert(tk.END, "\n\n")
+            self.notebook_output_text.insert(tk.END, "Rendered image output:\n")
+        for mime_type, image_data in image_outputs:
+            self.notebook_output_text.insert(tk.END, f"[{mime_type}]\n")
+            try:
+                photo = tk.PhotoImage(data=image_data)
+            except Exception:
+                self.notebook_output_text.insert(tk.END, "Could not render this image in the desktop viewer.\n")
+                continue
+            self.notebook_output_images.append(photo)
+            self.notebook_output_text.image_create(tk.END, image=photo)
+            self.notebook_output_text.insert(tk.END, "\n")
+        self.notebook_output_text.configure(state="disabled")
+
+    def _notebook_image_outputs(self, cell: dict[str, object]) -> list[tuple[str, str]]:
+        outputs = cell.get("outputs", [])
+        if not isinstance(outputs, list):
+            return []
+        images: list[tuple[str, str]] = []
+        for output in outputs:
+            if not isinstance(output, dict):
+                continue
+            data = output.get("data", {})
+            if not isinstance(data, dict):
+                continue
+            for mime_type in ("image/png", "image/jpeg", "image/gif"):
+                if mime_type not in data:
+                    continue
+                images.append((mime_type, self._notebook_output_value_to_text(data[mime_type])))
+        return images
+
+    def _notebook_cell_summary(self, index: int, cell: dict[str, object]) -> str:
+        cell_type = str(cell.get("cell_type", "code"))
+        execution_count = cell.get("execution_count")
+        count_label = f"[{execution_count}]" if execution_count not in (None, "") else ""
+        source = self._notebook_source_to_text(cell.get("source", ""))
+        first_line = next((line.strip() for line in source.splitlines() if line.strip()), "")
+        if len(first_line) > 54:
+            first_line = f"{first_line[:51]}..."
+        if not first_line:
+            first_line = "empty cell"
+        return f"{index + 1}. {cell_type} {count_label}  {first_line}"
+
+    def _current_notebook_cell_index(self) -> int | None:
+        if self.notebook_selected_cell_index is not None:
+            return self.notebook_selected_cell_index
+        if hasattr(self, "notebook_cell_listbox"):
+            selection = self.notebook_cell_listbox.curselection()
+            if selection:
+                return int(selection[0])
+        return None
+
+    def _add_notebook_cell(self, cell_type: str) -> None:
+        if self.notebook_data is None:
+            messagebox.showinfo("No notebook", "Add or open a notebook before adding cells.")
+            return
+        self._commit_notebook_editor_cell()
+        cells = self._notebook_cells()
+        insert_index = len(cells)
+        current_index = self._current_notebook_cell_index()
+        if current_index is not None and 0 <= current_index < len(cells):
+            insert_index = current_index + 1
+
+        if cell_type == "markdown":
+            cell = {"cell_type": "markdown", "id": uuid.uuid4().hex[:8], "metadata": {}, "source": ""}
+        else:
+            cell = {
+                "cell_type": "code",
+                "id": uuid.uuid4().hex[:8],
+                "metadata": {},
+                "execution_count": None,
+                "source": "",
+                "outputs": [],
+            }
+        cells.insert(insert_index, cell)
+        self.notebook_selected_cell_index = insert_index
+        self.notebook_modified = True
+        self._sync_notebook_cell_listbox()
+        self._refresh_notebook_editor()
+        self._refresh_notebook_status()
+
+    def _delete_selected_notebook_cell(self) -> None:
+        if self.notebook_data is None:
+            return
+        cells = self._notebook_cells()
+        index = self._current_notebook_cell_index()
+        if index is None or not 0 <= index < len(cells):
+            return
+        del cells[index]
+        self.notebook_selected_cell_index = min(index, len(cells) - 1) if cells else None
+        self.notebook_modified = True
+        self._sync_notebook_cell_listbox()
+        self._refresh_notebook_editor()
+        self._refresh_notebook_status()
+
+    def _remove_selected_notebooks(self) -> None:
+        selection = list(self.notebook_file_listbox.curselection())
+        if not selection:
+            return
+        selected_paths = {self.notebook_file_paths[index] for index in selection if index < len(self.notebook_file_paths)}
+        if self.notebook_path in selected_paths and not self._confirm_notebook_changes():
+            return
+        self.notebook_file_paths = [path for path in self.notebook_file_paths if path not in selected_paths]
+        if self.notebook_path in selected_paths:
+            self._clear_loaded_notebook()
+            if self.notebook_file_paths:
+                self._load_notebook_file(self.notebook_file_paths[0], confirm_unsaved=False)
+        else:
+            self._sync_notebook_file_listbox()
+
+    def _clear_notebooks(self) -> None:
+        if not self._confirm_notebook_changes():
+            return
+        self.notebook_file_paths = []
+        self._clear_loaded_notebook()
+
+    def _reload_notebook(self) -> None:
+        if self.notebook_path is None:
+            messagebox.showinfo("No notebook", "Add or open a notebook before reloading.")
+            return
+        path = self.notebook_path
+        self._load_notebook_file(path)
+
+    def _save_notebook(self) -> bool:
+        if self.notebook_data is None:
+            messagebox.showinfo("No notebook", "Add or open a notebook before saving.")
+            return False
+        self._commit_notebook_editor_cell()
+        if self.notebook_path is None:
+            return self._save_notebook_as()
+        try:
+            self._write_notebook(self.notebook_path)
+        except Exception as exc:
+            messagebox.showerror("Notebook save failed", str(exc))
+            return False
+        self.notebook_modified = False
+        self._refresh_notebook_status()
+        self._sync_notebook_file_listbox()
+        return True
+
+    def _save_notebook_as(self) -> bool:
+        if self.notebook_data is None:
+            messagebox.showinfo("No notebook", "Add or open a notebook before saving.")
+            return False
+        path = filedialog.asksaveasfilename(
+            title="Save Jupyter notebook",
+            defaultextension=".ipynb",
+            filetypes=JUPYTER_NOTEBOOK_FILE_TYPES,
+        )
+        if not path:
+            return False
+        self._commit_notebook_editor_cell()
+        notebook_path = str(Path(path).expanduser().resolve())
+        try:
+            self._write_notebook(notebook_path)
+        except Exception as exc:
+            messagebox.showerror("Notebook save failed", str(exc))
+            return False
+        self.notebook_path = notebook_path
+        if notebook_path not in self.notebook_file_paths:
+            self.notebook_file_paths.append(notebook_path)
+        self.notebook_modified = False
+        self._sync_notebook_file_listbox()
+        self._refresh_notebook_status()
+        return True
+
+    def _write_notebook(self, path: str) -> None:
+        assert self.notebook_data is not None
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(self.notebook_data, handle, indent=1, ensure_ascii=False)
+            handle.write("\n")
+
+    def _run_notebook(self) -> None:
+        if self.notebook_data is None:
+            messagebox.showinfo("No notebook", "Add or open a notebook before running.")
+            return
+        self._commit_notebook_editor_cell()
+        self._refresh_notebook_status("Running notebook...")
+        self.root.update_idletasks()
+        try:
+            executed_data = self._execute_notebook_data(self.notebook_data)
+        except Exception as exc:
+            self._refresh_notebook_status("Notebook execution failed.")
+            messagebox.showerror("Notebook run failed", str(exc))
+            return
+
+        self.notebook_data = executed_data
+        self.notebook_modified = True
+        self._sync_notebook_cell_listbox()
+        self._refresh_notebook_editor()
+        status = "Notebook finished with errors; inspect cell output before saving."
+        if not self._notebook_has_errors(executed_data):
+            status = "Notebook run complete; save to keep updated outputs."
+        self._refresh_notebook_status(status)
+
+    def _run_selected_notebook_cell(self) -> None:
+        if self.notebook_data is None:
+            messagebox.showinfo("No notebook", "Add or open a notebook before running cells.")
+            return
+        index = self._current_notebook_cell_index()
+        cells = self._notebook_cells()
+        if index is None or not 0 <= index < len(cells):
+            return
+        if str(cells[index].get("cell_type", "code")) != "code":
+            messagebox.showinfo("Not a code cell", "Only code cells can be executed.")
+            return
+
+        self._commit_notebook_editor_cell()
+        partial_data = copy.deepcopy(self.notebook_data)
+        partial_data["cells"] = copy.deepcopy(self._notebook_cells()[: index + 1])
+        self._refresh_notebook_status(f"Running cell {index + 1}...")
+        self.root.update_idletasks()
+        try:
+            executed_data = self._execute_notebook_data(partial_data)
+        except Exception as exc:
+            self._refresh_notebook_status("Cell execution failed.")
+            messagebox.showerror("Cell run failed", str(exc))
+            return
+
+        executed_cells = executed_data.get("cells", []) if isinstance(executed_data, dict) else []
+        if isinstance(executed_cells, list) and index < len(executed_cells):
+            executed_cell = executed_cells[index]
+            if isinstance(executed_cell, dict):
+                cells[index]["outputs"] = executed_cell.get("outputs", [])
+                cells[index]["execution_count"] = executed_cell.get("execution_count")
+        self.notebook_modified = True
+        self.notebook_selected_cell_index = index
+        self._sync_notebook_cell_listbox()
+        self._refresh_notebook_editor()
+        status = f"Cell {index + 1} finished with errors; inspect output before saving."
+        if not self._notebook_has_errors({"cells": [cells[index]]}):
+            status = f"Cell {index + 1} run complete; save to keep updated output."
+        self._refresh_notebook_status(status)
+
+    def _execute_notebook_data(self, data: dict[str, object]) -> dict[str, object]:
+        try:
+            import nbformat
+            from nbclient import NotebookClient
+        except ImportError as exc:
+            raise RuntimeError(
+                "Notebook execution requires nbformat, nbclient, and a Python Jupyter kernel."
+            ) from exc
+
+        notebook = nbformat.from_dict(copy.deepcopy(data))
+        working_dir = Path(self.notebook_path).parent if self.notebook_path is not None else Path.cwd()
+        resources = {"metadata": {"path": str(working_dir)}}
+        client = NotebookClient(
+            notebook,
+            timeout=600,
+            allow_errors=True,
+            resources=resources,
+            kernel_name=self._notebook_kernel_name(notebook),
+        )
+        client.execute()
+        return json.loads(nbformat.writes(notebook))
+
+    def _notebook_kernel_name(self, notebook: object) -> str:
+        metadata = getattr(notebook, "metadata", {})
+        if isinstance(metadata, dict):
+            kernelspec = metadata.get("kernelspec", {})
+            if isinstance(kernelspec, dict):
+                name = kernelspec.get("name")
+                if name:
+                    return str(name)
+        return "python3"
+
+    def _notebook_has_errors(self, data: dict[str, object]) -> bool:
+        cells = data.get("cells", [])
+        if not isinstance(cells, list):
+            return False
+        for cell in cells:
+            if not isinstance(cell, dict):
+                continue
+            outputs = cell.get("outputs", [])
+            if not isinstance(outputs, list):
+                continue
+            for output in outputs:
+                if isinstance(output, dict) and output.get("output_type") == "error":
+                    return True
+        return False
+
     def _add_parameter_row(self, parent: ttk.LabelFrame, row: int, label: str, key: str) -> None:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w")
         entry = ttk.Entry(parent, textvariable=self.parameter_vars[key], width=16)
         entry.grid(row=row, column=1, sticky="e", padx=(10, 0), pady=2)
 
     def _add_sequence_files(self) -> None:
-        selected = list(filedialog.askopenfilenames(title="Choose NetCDF files", filetypes=FILE_TYPES))
+        selected = list(filedialog.askopenfilenames(title="Choose data files", filetypes=FILE_TYPES))
         if not selected:
             return
 
@@ -3849,7 +4788,7 @@ class AnalysisApp:
 
     def _run_sequence_viewer(self) -> None:
         if not self.sequence_file_paths:
-            messagebox.showerror("Missing files", "Please choose at least one NetCDF file.")
+            messagebox.showerror("Missing files", "Please choose at least one data file.")
             return
 
         try:
@@ -3974,7 +4913,7 @@ class AnalysisApp:
         if self.sequence_file_paths:
             message = "Ready to load.\nOrder the files, choose a map, then click Load Sequence."
         else:
-            message = "Add NetCDF files to view the full sequence."
+            message = "Add data files to view the full sequence."
         axis.text(0.5, 0.5, message, ha="center", va="center", fontsize=13)
         axis.set_axis_off()
         self.sequence_canvas.draw_idle()
@@ -3995,7 +4934,7 @@ class AnalysisApp:
         if hasattr(self, "sequence_summary_text"):
             self._set_text_widget(self.sequence_summary_text, "")
         if not self.sequence_file_paths:
-            self.sequence_status_var.set("Add NetCDF files in sequence order, choose a map, then load the sequence viewer.")
+            self.sequence_status_var.set("Add data files in sequence order, choose a map, then load the sequence viewer.")
 
     def _sync_sequence_selection_listbox(self) -> None:
         self.sequence_selection_listbox.delete(0, tk.END)
@@ -4355,7 +5294,7 @@ class AnalysisApp:
         self.sequence_status_var.set(f"Saved sequence comparison plot to {path}")
 
     def _add_change_files(self) -> None:
-        selected = list(filedialog.askopenfilenames(title="Choose NetCDF files", filetypes=FILE_TYPES))
+        selected = list(filedialog.askopenfilenames(title="Choose data files", filetypes=FILE_TYPES))
         if not selected:
             return
 
@@ -4583,7 +5522,7 @@ class AnalysisApp:
 
     def _run_change_analysis(self) -> None:
         if not self.change_file_paths:
-            messagebox.showerror("Missing files", "Please choose at least one NetCDF file.")
+            messagebox.showerror("Missing files", "Please choose at least one data file.")
             return
         if self.change_initial_path not in self.change_file_paths:
             messagebox.showerror("Missing initial state", "Choose which file is the initial state.")
@@ -4790,7 +5729,7 @@ class AnalysisApp:
         return counts
 
     def _add_curve_files(self) -> None:
-        selected = list(filedialog.askopenfilenames(title="Choose NetCDF files", filetypes=FILE_TYPES))
+        selected = list(filedialog.askopenfilenames(title="Choose data files", filetypes=FILE_TYPES))
         if not selected:
             return
 
@@ -4915,7 +5854,7 @@ class AnalysisApp:
 
     def _run_curve_comparison(self) -> None:
         if len(self.curve_file_paths) < 2:
-            messagebox.showerror("Missing files", "Please choose at least two NetCDF files.")
+            messagebox.showerror("Missing files", "Please choose at least two data files.")
             return
         if self.curve_first_path is None or self.curve_second_path is None:
             messagebox.showerror("Missing pair", "Choose the first and second files to compare.")
@@ -5016,14 +5955,14 @@ class AnalysisApp:
         if len(self.curve_file_paths) >= 2:
             message = "Ready to compare.\nChoose two files, set the MDC window, then click Run EDC/MDC Compare."
         else:
-            message = "Add at least two NetCDF files to compare point EDC and MDC curves."
+            message = "Add at least two data files to compare point EDC and MDC curves."
         axis.text(0.5, 0.5, message, ha="center", va="center", fontsize=13)
         axis.set_axis_off()
         self.curve_canvas.draw_idle()
         self.curve_map_axes = []
         self._set_text_widget(self.curve_summary_text, "")
         if len(self.curve_file_paths) < 2:
-            self.curve_status_var.set("Add at least two NetCDF files, choose a pair, then run the EDC/MDC comparison.")
+            self.curve_status_var.set("Add at least two data files, choose a pair, then run the EDC/MDC comparison.")
 
     def _refresh_curve_plot(self) -> None:
         assert self.curve_selected_pixel is not None
@@ -5428,7 +6367,7 @@ class AnalysisApp:
         self.curve_status_var.set(f"Saved EDC/MDC plot to {path}")
 
     def _add_feature_files(self) -> None:
-        selected = list(filedialog.askopenfilenames(title="Choose NetCDF files", filetypes=FILE_TYPES))
+        selected = list(filedialog.askopenfilenames(title="Choose data files", filetypes=FILE_TYPES))
         if not selected:
             return
 
@@ -5567,7 +6506,7 @@ class AnalysisApp:
 
     def _run_feature_search(self) -> None:
         if len(self.feature_file_paths) < 2:
-            messagebox.showerror("Missing files", "Please choose at least two NetCDF files.")
+            messagebox.showerror("Missing files", "Please choose at least two data files.")
             return
         if self.feature_first_path is None or self.feature_second_path is None:
             messagebox.showerror("Missing pair", "Choose the first and second files to compare.")
@@ -5820,14 +6759,14 @@ class AnalysisApp:
         if len(self.feature_file_paths) >= 2:
             message = "Ready to search.\nChoose two files, then click Search Special Features."
         else:
-            message = "Add at least two NetCDF files to search for special feature changes."
+            message = "Add at least two data files to search for special feature changes."
         axis.text(0.5, 0.5, message, ha="center", va="center", fontsize=13)
         axis.set_axis_off()
         self.feature_canvas.draw_idle()
         self.feature_map_axes = []
         self._set_text_widget(self.feature_summary_text, "")
         if len(self.feature_file_paths) < 2:
-            self.feature_status_var.set("Add at least two NetCDF files, choose a pair, then search for special features.")
+            self.feature_status_var.set("Add at least two data files, choose a pair, then search for special features.")
 
     def _refresh_feature_plot(self) -> None:
         assert self.feature_selected_pixel is not None
@@ -6032,7 +6971,7 @@ class AnalysisApp:
         self._render_classifier_placeholder()
 
     def _choose_classifier_file(self) -> None:
-        selected = filedialog.askopenfilename(title="Choose NetCDF file", filetypes=FILE_TYPES)
+        selected = filedialog.askopenfilename(title="Choose data file", filetypes=FILE_TYPES)
         if not selected:
             return
         self._set_classifier_file(selected)
@@ -6075,7 +7014,7 @@ class AnalysisApp:
 
     def _run_state_classifier(self) -> None:
         if self.classifier_file_path is None:
-            messagebox.showerror("Missing file", "Please choose one NetCDF file for clustering.")
+            messagebox.showerror("Missing file", "Please choose one data file for clustering.")
             return
 
         try:
@@ -6156,9 +7095,9 @@ class AnalysisApp:
         self.classifier_figure.clear()
         axis = self.classifier_figure.add_subplot(111)
         message = (
-            "Ready to cluster.\nChoose one NetCDF file, tune the windows, then click Compute and Classify."
+            "Ready to cluster.\nChoose one data file, tune the windows, then click Compute and Classify."
             if self.classifier_file_path
-            else "Choose one NetCDF file to compute eight per-pixel spectral features."
+            else "Choose one data file to compute eight per-pixel spectral features."
         )
         axis.text(0.5, 0.5, message, ha="center", va="center", fontsize=13)
         axis.set_axis_off()
@@ -6167,7 +7106,7 @@ class AnalysisApp:
         if hasattr(self, "classifier_summary_text"):
             self._set_text_widget(self.classifier_summary_text, "")
         if self.classifier_file_path is None:
-            self.classifier_status_var.set("Choose one NetCDF file, set feature windows, then compute rule-based state labels.")
+            self.classifier_status_var.set("Choose one data file, set feature windows, then compute rule-based state labels.")
 
     def _classifier_display_map(self, key: str) -> np.ndarray:
         assert self.classifier_result is not None
@@ -6407,7 +7346,7 @@ class AnalysisApp:
         self.classifier_status_var.set(f"Saved clustering plot to {path}")
 
     def _add_switching_files(self) -> None:
-        selected = list(filedialog.askopenfilenames(title="Choose NetCDF files", filetypes=FILE_TYPES))
+        selected = list(filedialog.askopenfilenames(title="Choose data files", filetypes=FILE_TYPES))
         if not selected:
             return
 
@@ -6488,7 +7427,7 @@ class AnalysisApp:
 
     def _run_switching_map(self) -> None:
         if len(self.switching_file_paths) < 2:
-            messagebox.showerror("Missing files", "Please choose at least two chronological NetCDF files.")
+            messagebox.showerror("Missing files", "Please choose at least two chronological data files.")
             return
 
         try:
@@ -6548,7 +7487,7 @@ class AnalysisApp:
         message = (
             "Ready to predict switching sites.\nOrder the files chronologically, tune EF/LHB windows, then compute the map."
             if self.switching_file_paths
-            else "Add chronological NetCDF files to build a Switching Map."
+            else "Add chronological data files to build a Switching Map."
         )
         axis.text(0.5, 0.5, message, ha="center", va="center", fontsize=13)
         axis.set_axis_off()
@@ -6557,7 +7496,7 @@ class AnalysisApp:
         if hasattr(self, "switching_summary_text"):
             self._set_text_widget(self.switching_summary_text, "")
         if not self.switching_file_paths:
-            self.switching_status_var.set("Add chronological NetCDF files, tune EF/LHB windows, then compute switching sites.")
+            self.switching_status_var.set("Add chronological data files, tune EF/LHB windows, then compute switching sites.")
 
     def _refresh_switching_plot(self) -> None:
         assert self.switching_result is not None
@@ -6903,7 +7842,7 @@ class AnalysisApp:
         self.switching_status_var.set(f"Saved Switching Map plot to {path}")
 
     def _add_state_prediction_files(self) -> None:
-        selected = list(filedialog.askopenfilenames(title="Choose NetCDF files", filetypes=FILE_TYPES))
+        selected = list(filedialog.askopenfilenames(title="Choose data files", filetypes=FILE_TYPES))
         if not selected:
             return
 
@@ -6997,7 +7936,7 @@ class AnalysisApp:
 
     def _run_state_prediction(self) -> None:
         if len(self.state_prediction_file_paths) < 2:
-            messagebox.showerror("Missing files", "Please choose at least two chronological NetCDF files.")
+            messagebox.showerror("Missing files", "Please choose at least two chronological data files.")
             return
 
         try:
@@ -7060,7 +7999,7 @@ class AnalysisApp:
         message = (
             "Ready to compare initial features to future switching.\nOrder chronological files, tune windows, then compute State Prediction."
             if self.state_prediction_file_paths
-            else "Add chronological NetCDF files to build State Prediction diagnostics."
+            else "Add chronological data files to build State Prediction diagnostics."
         )
         axis.text(0.5, 0.5, message, ha="center", va="center", fontsize=13)
         axis.set_axis_off()
@@ -7071,7 +8010,7 @@ class AnalysisApp:
             self._set_text_widget(self.state_prediction_summary_text, "")
         if not self.state_prediction_file_paths:
             self.state_prediction_status_var.set(
-                "Add chronological NetCDF files, then compare future switching to initial-state features."
+                "Add chronological data files, then compare future switching to initial-state features."
             )
 
     def _refresh_state_prediction_plot(self) -> None:
@@ -7599,7 +8538,7 @@ class AnalysisApp:
         self.state_prediction_status_var.set(f"Saved State Prediction plot to {path}")
 
     def _add_initial_transition_files(self) -> None:
-        selected = list(filedialog.askopenfilenames(title="Choose NetCDF files", filetypes=FILE_TYPES))
+        selected = list(filedialog.askopenfilenames(title="Choose data files", filetypes=FILE_TYPES))
         if not selected:
             return
         new_paths = [str(Path(path).expanduser().resolve()) for path in selected]
@@ -7801,7 +8740,7 @@ class AnalysisApp:
     def _run_initial_transition_analysis(self) -> None:
         files = self._initial_transition_included_files()
         if len(files) < 2:
-            messagebox.showerror("Missing files", "Please choose at least two included NetCDF files.")
+            messagebox.showerror("Missing files", "Please choose at least two included data files.")
             return
         try:
             params = self._parse_initial_transition_parameters()
@@ -8163,7 +9102,7 @@ class AnalysisApp:
         self.initial_transition_status_var.set(f"Exported transition feature tables to {paths['metrics_table']}")
 
     def _add_mechanism_files(self) -> None:
-        selected = list(filedialog.askopenfilenames(title="Choose NetCDF files", filetypes=FILE_TYPES))
+        selected = list(filedialog.askopenfilenames(title="Choose data files", filetypes=FILE_TYPES))
         if not selected:
             return
         new_paths = [str(Path(path).expanduser().resolve()) for path in selected]
@@ -8302,7 +9241,7 @@ class AnalysisApp:
             if len(files) < 2:
                 messagebox.showerror(
                     "Missing files",
-                    "Add at least two NetCDF files in this view, Initial State Transition Features, or Analysis.",
+                    "Add at least two data files in this view, Initial State Transition Features, or Analysis.",
                 )
                 return
             if files and params.transition_parameters.reference_index >= len(files):
@@ -8907,7 +9846,7 @@ class AnalysisApp:
         self.mechanism_status_var.set(f"Exported mechanism diagnostics to {paths['summary']}")
 
     def _add_transition_outcome_files(self) -> None:
-        selected = list(filedialog.askopenfilenames(title="Choose NetCDF files", filetypes=FILE_TYPES))
+        selected = list(filedialog.askopenfilenames(title="Choose data files", filetypes=FILE_TYPES))
         if not selected:
             return
 
@@ -9045,7 +9984,7 @@ class AnalysisApp:
 
     def _run_transition_outcome_maps(self) -> None:
         if len(self.transition_outcome_file_paths) < 2:
-            messagebox.showerror("Missing files", "Please choose at least two chronological NetCDF files.")
+            messagebox.showerror("Missing files", "Please choose at least two chronological data files.")
             return
 
         try:
@@ -9123,7 +10062,7 @@ class AnalysisApp:
         message = (
             "Ready to map transition-level writing and erasing.\nAdd/order files, optionally enter pulse labels, then compute."
             if self.transition_outcome_file_paths
-            else "Add chronological NetCDF files to build Transition Outcome Maps."
+            else "Add chronological data files to build Transition Outcome Maps."
         )
         axis.text(0.5, 0.5, message, ha="center", va="center", fontsize=13)
         axis.set_axis_off()
@@ -9143,7 +10082,7 @@ class AnalysisApp:
             self.transition_outcome_inspector_canvas.draw_idle()
         if not self.transition_outcome_file_paths:
             self.transition_outcome_status_var.set(
-                "Add chronological NetCDF files to map written and erased pixels for each transition."
+                "Add chronological data files to map written and erased pixels for each transition."
             )
 
     def _refresh_transition_outcome_plot(self) -> None:
@@ -9971,11 +10910,11 @@ class AnalysisApp:
         self.transition_outcome_status_var.set(f"Saved Transition Outcome plot to {path}")
 
     def _add_files(self) -> None:
-        selected = list(filedialog.askopenfilenames(title="Choose NetCDF files", filetypes=FILE_TYPES))
+        selected = list(filedialog.askopenfilenames(title="Choose ARPES or SEM files", filetypes=UPLOAD_FILE_TYPES))
         if not selected:
             return
 
-        new_paths = [str(Path(path).expanduser().resolve()) for path in selected]
+        new_paths = self._extract_topography_files(selected)
         merged = self.file_paths + [path for path in new_paths if path not in self.file_paths]
         if len(merged) > 4:
             messagebox.showwarning(
@@ -10097,6 +11036,61 @@ class AnalysisApp:
         params.validate()
         return params
 
+    def _choose_topography_file(self) -> None:
+        selected = filedialog.askopenfilename(title="Choose SEM TIFF image", filetypes=SEM_FILE_TYPES)
+        if not selected:
+            return
+        self._set_topography_file(selected)
+        self.view_var.set("Topography Map")
+        self._refresh_main_plot()
+
+    def _clear_topography_file(self) -> None:
+        self.topography_file_path = None
+        self.topography_cache_path = None
+        self.topography_cache_image = None
+        self.topography_file_var.set("")
+        self._sync_uploaded_file_listbox()
+        self._sync_runner_file_listbox()
+        self._update_upload_status()
+        self._refresh_main_plot()
+
+    def _set_topography_file(self, file_path: str | None) -> None:
+        if file_path is None:
+            self._clear_topography_file()
+            return
+        resolved = str(Path(file_path).expanduser().resolve())
+        self.topography_file_path = resolved
+        self.topography_cache_path = None
+        self.topography_cache_image = None
+        self.topography_file_var.set(Path(resolved).name)
+        self._sync_uploaded_file_listbox()
+        self._sync_runner_file_listbox()
+        self._update_upload_status()
+
+    def _raw_topography_image(self) -> np.ndarray:
+        if self.topography_file_path is None:
+            raise ValueError("Choose a SEM TIFF image before opening the Topography Map view.")
+        if self.topography_cache_path != self.topography_file_path or self.topography_cache_image is None:
+            self.topography_cache_image = load_topography_image(self.topography_file_path)
+            self.topography_cache_path = self.topography_file_path
+        return np.asarray(self.topography_cache_image, dtype=np.float32)
+
+    def _topography_map_for_shape(self, target_shape: tuple[int, int]) -> np.ndarray:
+        image = self._raw_topography_image()
+        image_xy = np.flipud(image).T
+        try:
+            rotation = int(float(self.topography_rotation_var.get()))
+        except ValueError:
+            rotation = 0
+        if rotation % 90 != 0:
+            rotation = 0
+        image_xy = np.rot90(image_xy, k=(rotation // 90) % 4)
+        if bool(self.topography_flip_x_var.get()):
+            image_xy = image_xy[::-1, :]
+        if bool(self.topography_flip_y_var.get()):
+            image_xy = image_xy[:, ::-1]
+        return robust_normalize_map(resample_spatial_map(image_xy, target_shape, order=1))
+
     def _parse_cluster_parameters(self) -> SpectralClusterParameters:
         try:
             params = SpectralClusterParameters(
@@ -10147,7 +11141,7 @@ class AnalysisApp:
 
     def _run_analysis(self) -> None:
         if not 1 <= len(self.file_paths) <= 4:
-            messagebox.showerror("Missing files", "Please choose between one and four NetCDF files.")
+            messagebox.showerror("Missing files", "Please choose between one and four data files.")
             return
 
         try:
@@ -10243,7 +11237,7 @@ class AnalysisApp:
             axis.text(
                 0.5,
                 0.5,
-                "Choose 1 to 4 NetCDF files to begin.",
+                "Choose 1 to 4 data files to begin.",
                 ha="center",
                 va="center",
                 fontsize=14,
@@ -10276,7 +11270,7 @@ class AnalysisApp:
         if self.change_file_paths:
             message = "Ready to analyze.\nChoose the initial state, arrange the sequence, then click Analyze Changes."
         else:
-            message = "Add NetCDF files to compare each state against an initial file."
+            message = "Add data files to compare each state against an initial file."
         axis.text(0.5, 0.5, message, ha="center", va="center", fontsize=13)
         axis.set_axis_off()
         self.change_canvas.draw_idle()
@@ -10295,7 +11289,7 @@ class AnalysisApp:
         self.change_sequence_canvas.draw_idle()
         self._set_text_widget(self.change_summary_text, "")
         if not self.change_file_paths:
-            self.change_status_var.set("Add NetCDF files, label the initial state, then run the initial-state change view.")
+            self.change_status_var.set("Add data files, label the initial state, then run the initial-state change view.")
 
     def _refresh_change_views(self) -> None:
         if self.change_valid_mask is None or not self.change_loaded_states:
@@ -11214,6 +12208,113 @@ class AnalysisApp:
 
         self._set_text_widget(self.cluster_text, "\n".join(lines))
 
+    def _topography_base_payload(self) -> tuple[np.ndarray, str, str]:
+        assert self.result is not None
+        option = self.topography_base_var.get()
+        state_index = self._current_state_index()
+        state_name = self.result.state_names[state_index]
+        if option == "Total intensity":
+            return self.result.total_maps[state_index], f"{state_name}: total intensity", "viridis"
+        if option == "Feature map":
+            feature_name = self.feature_var.get() or self.result.feature_names[0]
+            return self.result.features_by_state[state_index][feature_name], f"{state_name}: {feature_name}", "viridis"
+        if option == "Average normalized total map":
+            return self.result.average_normalized_total_map, "Average normalized total map", "magma"
+        return self.result.ef_maps[state_index], f"{state_name}: near-EF intensity", "viridis"
+
+    def _spatial_pearson(self, first: np.ndarray, second: np.ndarray, mask: np.ndarray | None = None) -> float | None:
+        a = np.asarray(first, dtype=np.float32)
+        b = np.asarray(second, dtype=np.float32)
+        valid = np.isfinite(a) & np.isfinite(b)
+        if mask is not None and mask.shape == valid.shape:
+            valid &= mask
+        if int(valid.sum()) < 3:
+            return None
+        av = a[valid].astype(np.float64)
+        bv = b[valid].astype(np.float64)
+        av -= float(av.mean())
+        bv -= float(bv.mean())
+        denominator = float(np.sqrt(np.sum(av * av) * np.sum(bv * bv)))
+        if denominator <= 1e-12:
+            return None
+        return float(np.sum(av * bv) / denominator)
+
+    def _render_topography_map_view(self) -> None:
+        assert self.result is not None
+        base, base_title, base_cmap = self._topography_base_payload()
+        normalized_base = robust_normalize_map(base)
+
+        if self.topography_file_path is None:
+            axis = self.main_figure.add_subplot(111)
+            image = axis.imshow(base.T, origin="lower", cmap=base_cmap, aspect="auto")
+            axis.text(
+                0.5,
+                0.5,
+                "Choose a SEM TIFF file in the Topography Map controls.",
+                ha="center",
+                va="center",
+                transform=axis.transAxes,
+                fontsize=12,
+                bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "alpha": 0.85, "edgecolor": "#bbbbbb"},
+            )
+            axis.set_title(base_title)
+            axis.set_xlabel("x index")
+            axis.set_ylabel("y index")
+            self.main_figure.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
+            self._mark_selected_pixel(axis)
+            return
+
+        try:
+            topography = self._topography_map_for_shape(base.shape)
+        except Exception as exc:
+            axis = self.main_figure.add_subplot(111)
+            image = axis.imshow(base.T, origin="lower", cmap=base_cmap, aspect="auto")
+            axis.text(
+                0.5,
+                0.5,
+                f"Could not load SEM TIFF:\n{exc}",
+                ha="center",
+                va="center",
+                transform=axis.transAxes,
+                fontsize=11,
+                bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "alpha": 0.88, "edgecolor": "#bbbbbb"},
+            )
+            axis.set_title(base_title)
+            axis.set_xlabel("x index")
+            axis.set_ylabel("y index")
+            self.main_figure.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
+            self._mark_selected_pixel(axis)
+            self.status_var.set(f"Topography Map could not load {Path(self.topography_file_path).name}.")
+            return
+        alpha = min(1.0, max(0.0, float(self.topography_alpha_var.get())))
+        correlation = self._spatial_pearson(normalized_base, topography, self.result.valid_mask)
+        correlation_text = "r unavailable" if correlation is None else f"valid-pixel r={correlation:.3f}"
+
+        axes = self.main_figure.subplots(1, 3)
+        arpes_axis, sem_axis, overlay_axis = axes
+
+        arpes_image = arpes_axis.imshow(base.T, origin="lower", cmap=base_cmap, aspect="auto")
+        arpes_axis.set_title(base_title)
+        arpes_axis.set_xlabel("x index")
+        arpes_axis.set_ylabel("y index")
+        self.main_figure.colorbar(arpes_image, ax=arpes_axis, fraction=0.046, pad=0.04)
+
+        sem_image = sem_axis.imshow(topography.T, origin="lower", cmap="gray", aspect="auto", vmin=0, vmax=1)
+        sem_axis.set_title(f"SEM topography\n{Path(self.topography_file_path).name}")
+        sem_axis.set_xlabel("x index")
+        sem_axis.set_ylabel("y index")
+        self.main_figure.colorbar(sem_image, ax=sem_axis, fraction=0.046, pad=0.04)
+
+        overlay_axis.imshow(normalized_base.T, origin="lower", cmap=base_cmap, aspect="auto", vmin=0, vmax=1)
+        overlay_axis.imshow(topography.T, origin="lower", cmap="gray", aspect="auto", vmin=0, vmax=1, alpha=alpha)
+        overlay_axis.contour(self.result.valid_mask.T.astype(float), levels=[0.5], colors="cyan", linewidths=0.7)
+        overlay_axis.set_title(f"Overlay alpha={alpha:.2f}\n{correlation_text}")
+        overlay_axis.set_xlabel("x index")
+        overlay_axis.set_ylabel("y index")
+
+        for axis in axes:
+            self._mark_selected_pixel(axis)
+
     def _refresh_main_plot(self) -> None:
         if self.result is None:
             self._render_placeholder_text()
@@ -11284,6 +12385,9 @@ class AnalysisApp:
             right.set_xlabel("row / column index")
             right.set_ylabel("occupancy fraction")
             right.legend(loc="best")
+
+        elif view == "Topography Map":
+            self._render_topography_map_view()
 
         elif view in {"Total intensity", "Near-EF intensity", "Feature map", "Cluster map", "Simple state map"}:
             state_index = self._current_state_index()
@@ -11724,6 +12828,14 @@ class AnalysisApp:
             "",
         ]
 
+        if self.topography_file_path is not None:
+            try:
+                topography = self._topography_map_for_shape(self.result.shape)
+                lines.append(f"SEM topography intensity: {float(topography[x_index, y_index]):.6f}")
+                lines.append("")
+            except Exception:
+                pass
+
         for state_index, state in enumerate(self.result.loaded_states):
             feature_map = self.result.features_by_state[state_index]
             cluster_id = int(self.result.cluster_maps[state_index][x_index, y_index])
@@ -11772,7 +12884,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "files",
         nargs="*",
-        help="Optional NetCDF files to preload in sequence order.",
+        help="Optional data files to preload in sequence order.",
     )
     parser.add_argument(
         "--headless-smoke-test",

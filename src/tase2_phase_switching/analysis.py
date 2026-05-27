@@ -17,6 +17,8 @@ import xarray as xr
 
 
 REQUIRED_DIMS = ("x", "y", "eV", "phi")
+TABLE_DATA_EXTENSIONS = {".csv", ".tsv", ".txt", ".dat"}
+NUMPY_DATA_EXTENSIONS = {".npy", ".npz"}
 SIMPLE_STATE_NAMES = ("insulating", "intermediate", "metallic")
 SIMPLE_STATE_COLORS = {
     "insulating": "#1f3b73",
@@ -985,7 +987,7 @@ def run_analysis(file_paths: list[str] | tuple[str, ...], parameters: AnalysisPa
 
     paths = [str(Path(path).expanduser().resolve()) for path in file_paths]
     if not 1 <= len(paths) <= 4:
-        raise ValueError("Please provide between 1 and 4 NetCDF files.")
+        raise ValueError("Please provide between 1 and 4 ARPES data files.")
 
     loaded_states, alignment_notes = align_loaded_states_for_comparison([load_state(path) for path in paths])
 
@@ -2211,11 +2213,17 @@ def write_rows_to_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def load_state(file_path: str) -> LoadedState:
     resolved = str(Path(file_path).expanduser().resolve())
-    dataset = open_nc_dataset(resolved)
-    try:
-        data_array = prepare_main_dataarray(dataset).load()
-    finally:
-        dataset.close()
+    suffix = Path(resolved).suffix.lower()
+    if suffix in TABLE_DATA_EXTENSIONS:
+        data_array = load_tabular_dataarray(resolved)
+    elif suffix in NUMPY_DATA_EXTENSIONS:
+        data_array = load_numpy_dataarray(resolved)
+    else:
+        dataset = open_nc_dataset(resolved)
+        try:
+            data_array = prepare_main_dataarray(dataset).load()
+        finally:
+            dataset.close()
 
     return LoadedState(
         name=Path(resolved).name,
@@ -2522,14 +2530,331 @@ def open_nc_dataset(file_path: str) -> xr.Dataset:
     for engine in engines_to_try:
         try:
             if engine is None:
-                return xr.open_dataset(file_path)
-            return xr.open_dataset(file_path, engine=engine)
+                dataset = xr.open_dataset(file_path)
+            else:
+                dataset = xr.open_dataset(file_path, engine=engine)
+            if dataset.data_vars:
+                return dataset
+            dataset.close()
+            if engine == "h5netcdf":
+                for group in numeric_hdf5_groups(file_path):
+                    grouped = xr.open_dataset(file_path, engine=engine, group=group)
+                    if grouped.data_vars:
+                        return grouped
+                    grouped.close()
+                errors.append("h5netcdf: root dataset contained no data variables and no numeric groups were found")
         except Exception as exc:  # pragma: no cover - exercised through multiple runtime backends
             label = "default" if engine is None else engine
             errors.append(f"{label}: {exc}")
 
     joined = "\n".join(errors) if errors else "No engines attempted."
     raise RuntimeError(f"Could not open dataset {file_path}.\n{joined}")
+
+
+def numeric_hdf5_groups(file_path: str) -> list[str]:
+    try:
+        import h5py
+    except ImportError:
+        return []
+
+    groups: list[tuple[str, int]] = []
+    try:
+        with h5py.File(file_path, "r") as handle:
+            def visit_group(name: str, obj: Any) -> None:
+                if not isinstance(obj, h5py.Group):
+                    return
+                numeric_size = 0
+                for item in obj.values():
+                    if isinstance(item, h5py.Dataset) and np.issubdtype(item.dtype, np.number) and item.shape:
+                        numeric_size += int(np.prod(item.shape))
+                if numeric_size > 0:
+                    groups.append((name, numeric_size))
+
+            handle.visititems(visit_group)
+    except Exception:
+        return []
+
+    groups.sort(key=lambda item: item[1], reverse=True)
+    return [name for name, _size in groups]
+
+
+def load_tabular_dataarray(file_path: str) -> xr.DataArray:
+    """Load long-form ARPES table exports.
+
+    Supported table columns are x, y, eV/energy, phi/angle, and intensity/counts.
+    Headerless files are interpreted as the first five columns in that order.
+    """
+
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    delimiter = sniff_table_delimiter(path)
+    has_header = table_appears_to_have_header(path)
+    if has_header:
+        table = np.genfromtxt(path, delimiter=delimiter, names=True, dtype=np.float64, encoding=None)
+        if table.dtype.names is None:
+            raise ValueError(f"Could not read named columns from table file: {file_path}")
+        table = np.atleast_1d(table)
+        columns = {name: np.asarray(table[name], dtype=np.float64) for name in table.dtype.names}
+        x = get_named_table_column(columns, ("x", "x_index", "xindex", "xpos", "x_pos", "pixel_x", "scan_x"))
+        y = get_named_table_column(columns, ("y", "y_index", "yindex", "ypos", "y_pos", "pixel_y", "scan_y"))
+        e = get_named_table_column(columns, ("ev", "e_v", "energy", "bindingenergy", "binding_energy", "ene", "e"))
+        phi = get_named_table_column(columns, ("phi", "angle", "angles", "theta", "momentum", "kx", "ky", "k"))
+        intensity = get_named_table_column(columns, ("intensity", "counts", "count", "signal", "value", "i", "z"))
+    else:
+        raw = np.genfromtxt(path, delimiter=delimiter, dtype=np.float64)
+        raw = np.asarray(raw, dtype=np.float64)
+        if raw.ndim == 1:
+            raw = raw.reshape(1, -1)
+        if raw.ndim != 2 or raw.shape[1] < 5:
+            raise ValueError(
+                "Headerless ARPES tables must have at least five columns: x, y, eV, phi, intensity."
+            )
+        x, y, e, phi, intensity = [raw[:, index] for index in range(5)]
+
+    return build_dataarray_from_long_table(x, y, e, phi, intensity, name=path.stem)
+
+
+def sniff_table_delimiter(path: Path) -> str | None:
+    line = first_nonempty_data_line(path)
+    if "," in line:
+        return ","
+    if "\t" in line:
+        return "\t"
+    return None
+
+
+def table_appears_to_have_header(path: Path) -> bool:
+    line = first_nonempty_data_line(path)
+    return any(character.isalpha() for character in line)
+
+
+def first_nonempty_data_line(path: Path) -> str:
+    with path.open("r", encoding="utf-8-sig", errors="replace") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                return stripped
+    raise ValueError(f"Table file is empty: {path}")
+
+
+def normalized_column_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", name.lower())
+
+
+def get_named_table_column(columns: dict[str, np.ndarray], aliases: tuple[str, ...]) -> np.ndarray:
+    normalized = {normalized_column_name(name): value for name, value in columns.items()}
+    for alias in aliases:
+        value = normalized.get(normalized_column_name(alias))
+        if value is not None:
+            return value
+    normalized_aliases = [normalized_column_name(alias) for alias in aliases]
+    for name, value in normalized.items():
+        for alias in normalized_aliases:
+            if alias in {"x", "y"} and name.startswith(alias):
+                return value
+            if len(alias) > 1 and alias in name:
+                return value
+    available = ", ".join(columns.keys())
+    raise ValueError(f"Missing required ARPES table column. Expected one of {aliases}; found {available}.")
+
+
+def build_dataarray_from_long_table(
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    e_values: np.ndarray,
+    phi_values: np.ndarray,
+    intensity_values: np.ndarray,
+    *,
+    name: str,
+) -> xr.DataArray:
+    arrays = [
+        np.asarray(values, dtype=np.float64).reshape(-1)
+        for values in (x_values, y_values, e_values, phi_values, intensity_values)
+    ]
+    lengths = {array.size for array in arrays}
+    if len(lengths) != 1:
+        raise ValueError("The x, y, eV, phi, and intensity table columns must have the same length.")
+
+    x, y, e, phi, intensity = arrays
+    finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(e) & np.isfinite(phi) & np.isfinite(intensity)
+    if not np.any(finite):
+        raise ValueError("No finite ARPES table rows were found.")
+
+    x = x[finite]
+    y = y[finite]
+    e = e[finite]
+    phi = phi[finite]
+    intensity = intensity[finite]
+
+    x_unique = np.unique(x)
+    y_unique = np.unique(y)
+    e_unique = np.unique(e)
+    phi_unique = np.unique(phi)
+
+    x_axis = x_unique.astype(np.float32)
+    y_axis = y_unique.astype(np.float32)
+    e_axis = e_unique.astype(np.float32)
+    phi_axis = phi_unique.astype(np.float32)
+
+    shape = (x_axis.size, y_axis.size, e_axis.size, phi_axis.size)
+    if any(size == 0 for size in shape):
+        raise ValueError("The ARPES table did not contain a complete set of coordinate axes.")
+
+    x_index = np.searchsorted(x_unique, x)
+    y_index = np.searchsorted(y_unique, y)
+    e_index = np.searchsorted(e_unique, e)
+    phi_index = np.searchsorted(phi_unique, phi)
+    flat_index = np.ravel_multi_index((x_index, y_index, e_index, phi_index), shape)
+
+    sums = np.zeros(int(np.prod(shape)), dtype=np.float64)
+    counts = np.zeros(int(np.prod(shape)), dtype=np.int64)
+    np.add.at(sums, flat_index, intensity)
+    np.add.at(counts, flat_index, 1)
+
+    values = np.full(sums.shape, np.nan, dtype=np.float32)
+    present = counts > 0
+    values[present] = (sums[present] / counts[present]).astype(np.float32)
+    values = values.reshape(shape)
+
+    return xr.DataArray(
+        values,
+        dims=REQUIRED_DIMS,
+        coords={"x": x_axis, "y": y_axis, "eV": e_axis, "phi": phi_axis},
+        name=name or "intensity",
+    )
+
+
+def load_numpy_dataarray(file_path: str) -> xr.DataArray:
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    if path.suffix.lower() == ".npy":
+        values = np.load(path)
+        coords: dict[str, np.ndarray] = {}
+    else:
+        archive = np.load(path)
+        try:
+            data_key = choose_numpy_data_key(archive)
+            values = archive[data_key]
+            coords = {
+                canonical: np.asarray(archive[key], dtype=np.float32)
+                for canonical in REQUIRED_DIMS
+                for key in matching_numpy_coord_keys(archive, canonical)[:1]
+            }
+        finally:
+            archive.close()
+
+    values = np.asarray(values, dtype=np.float32)
+    values = np.squeeze(values)
+    if values.ndim != 4:
+        raise ValueError(
+            f"NumPy ARPES data must be four-dimensional after squeezing; got shape {values.shape}."
+        )
+
+    default_coords = {
+        "x": np.arange(values.shape[0], dtype=np.float32),
+        "y": np.arange(values.shape[1], dtype=np.float32),
+        "eV": np.arange(values.shape[2], dtype=np.float32),
+        "phi": np.arange(values.shape[3], dtype=np.float32),
+    }
+    default_coords.update({key: value for key, value in coords.items() if value.shape == default_coords[key].shape})
+    return xr.DataArray(values, dims=REQUIRED_DIMS, coords=default_coords, name=path.stem or "intensity")
+
+
+def choose_numpy_data_key(archive: np.lib.npyio.NpzFile) -> str:
+    preferred = ("intensity", "data", "cube", "arpes", "values")
+    names = list(archive.files)
+    for key in preferred:
+        if key in names:
+            return key
+    numeric_arrays: list[tuple[str, int]] = []
+    for key in names:
+        array = archive[key]
+        if np.issubdtype(array.dtype, np.number) and np.squeeze(array).ndim == 4:
+            numeric_arrays.append((key, int(np.prod(array.shape))))
+    if not numeric_arrays:
+        raise ValueError("No four-dimensional numeric data array was found in the NumPy archive.")
+    numeric_arrays.sort(key=lambda item: item[1], reverse=True)
+    return numeric_arrays[0][0]
+
+
+def matching_numpy_coord_keys(archive: np.lib.npyio.NpzFile, canonical: str) -> list[str]:
+    aliases = {
+        "x": ("x", "x_axis", "xaxis", "x_coords", "xcoords"),
+        "y": ("y", "y_axis", "yaxis", "y_coords", "ycoords"),
+        "eV": ("ev", "e_v", "energy", "energy_axis", "binding_energy", "bindingenergy"),
+        "phi": ("phi", "phi_axis", "angle", "angle_axis", "theta", "theta_axis"),
+    }[canonical]
+    normalized_aliases = {normalized_column_name(alias) for alias in aliases}
+    return [key for key in archive.files if normalized_column_name(key) in normalized_aliases]
+
+
+def load_topography_image(file_path: str) -> np.ndarray:
+    path = Path(file_path).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    try:
+        from PIL import Image
+    except ImportError as exc:  # pragma: no cover - Pillow is available in the app environment
+        raise RuntimeError("Loading SEM TIFF files requires Pillow to be installed.") from exc
+
+    with Image.open(path) as image:
+        image.seek(0)
+        array = np.asarray(image)
+
+    array = np.asarray(array)
+    array = np.squeeze(array)
+    if array.ndim == 3:
+        if array.shape[-1] >= 3:
+            rgb = array[..., :3].astype(np.float32)
+            array = 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
+        elif array.shape[-1] == 1:
+            array = array[..., 0]
+    if array.ndim != 2:
+        raise ValueError(f"SEM topography image must be two-dimensional after conversion; got shape {array.shape}.")
+    return np.asarray(array, dtype=np.float32)
+
+
+def robust_normalize_map(values: np.ndarray, lower_percentile: float = 1.0, upper_percentile: float = 99.0) -> np.ndarray:
+    array = np.asarray(values, dtype=np.float32)
+    finite = array[np.isfinite(array)]
+    if finite.size == 0:
+        return np.zeros(array.shape, dtype=np.float32)
+    low = float(np.nanpercentile(finite, lower_percentile))
+    high = float(np.nanpercentile(finite, upper_percentile))
+    if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+        low = float(np.nanmin(finite))
+        high = float(np.nanmax(finite))
+    if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+        return np.zeros(array.shape, dtype=np.float32)
+    normalized = (array - low) / (high - low)
+    normalized = np.clip(normalized, 0.0, 1.0)
+    return finite_fill(normalized, 0.0).astype(np.float32)
+
+
+def resample_spatial_map(values: np.ndarray, target_shape: tuple[int, int], order: int = 1) -> np.ndarray:
+    array = np.asarray(values, dtype=np.float32)
+    if array.ndim != 2:
+        raise ValueError(f"Spatial map must be two-dimensional; got shape {array.shape}.")
+    if array.shape == target_shape:
+        return array.astype(np.float32, copy=True)
+    if array.shape[0] <= 0 or array.shape[1] <= 0:
+        raise ValueError("Cannot resample an empty spatial map.")
+
+    zoom = (target_shape[0] / array.shape[0], target_shape[1] / array.shape[1])
+    resized = ndimage.zoom(array, zoom=zoom, order=order).astype(np.float32)
+    if resized.shape == target_shape:
+        return resized
+
+    out = np.full(target_shape, np.nan, dtype=np.float32)
+    x_count = min(target_shape[0], resized.shape[0])
+    y_count = min(target_shape[1], resized.shape[1])
+    out[:x_count, :y_count] = resized[:x_count, :y_count]
+    return out
 
 
 def prepare_main_dataarray(dataset: xr.Dataset) -> xr.DataArray:
@@ -2598,7 +2923,10 @@ def guess_dim_name(dims: list[str], canonical: str, used: set[str]) -> str | Non
         "x": (("x",), ("x_", "_x", "xpos", "x_pos")),
         "y": (("y",), ("y_", "_y", "ypos", "y_pos")),
         "eV": (("ev", "energy", "bindingenergy", "binding_energy", "ene"), ("binding", "energy", "ev")),
-        "phi": (("phi", "angle", "angles", "theta", "momentum", "kx", "ky", "k"), ("phi", "angle", "theta", "momentum", "kx", "ky")),
+        "phi": (
+            ("phi", "angle", "angles", "theta", "momentum", "kx", "ky", "kp", "k"),
+            ("phi", "angle", "theta", "momentum", "kx", "ky", "kp"),
+        ),
     }
     exact_aliases, partial_aliases = alias_groups[canonical]
 
@@ -2731,15 +3059,16 @@ def extract_pixel_features(
         )
 
     spectra = data.reshape(x_size * y_size, e_size, phi_size)
-    total_intensity = spectra.sum(axis=(1, 2))
-    ef_intensity = spectra[:, ef_mask, :].sum(axis=(1, 2))
-    wide_intensity = spectra[:, wide_mask, :].sum(axis=(1, 2))
+    finite_spectra = finite_fill(spectra, 0.0)
+    total_intensity = np.nansum(spectra, axis=(1, 2))
+    ef_intensity = np.nansum(spectra[:, ef_mask, :], axis=(1, 2))
+    wide_intensity = np.nansum(spectra[:, wide_mask, :], axis=(1, 2))
 
     ef_fraction = safe_divide(ef_intensity, total_intensity)
     wide_fraction = safe_divide(wide_intensity, total_intensity)
 
-    energy_profile = spectra.sum(axis=2)
-    phi_profile = spectra.sum(axis=1)
+    energy_profile = np.nansum(spectra, axis=2)
+    phi_profile = np.nansum(spectra, axis=1)
 
     energy_profile_norm = normalize_rows(energy_profile)
     phi_profile_norm = normalize_rows(phi_profile)
@@ -2755,7 +3084,7 @@ def extract_pixel_features(
     right_intensity = phi_profile[:, phi_mid:].sum(axis=1)
     phi_asymmetry = safe_divide(right_intensity - left_intensity, right_intensity + left_intensity)
 
-    spectra_flat = spectra.reshape(x_size * y_size, -1)
+    spectra_flat = np.clip(finite_spectra.reshape(x_size * y_size, -1), 0.0, None)
     spectra_norm = normalize_rows(spectra_flat)
     spectral_entropy = -np.sum(spectra_norm * np.log(spectra_norm + 1e-12), axis=1)
     spectral_max = spectra_flat.max(axis=1)
@@ -3196,7 +3525,7 @@ def run_switching_map(
 
     paths = [str(Path(path).expanduser().resolve()) for path in file_paths]
     if len(paths) < 2:
-        raise ValueError("Switching Map needs at least two chronological NetCDF files.")
+        raise ValueError("Switching Map needs at least two chronological ARPES data files.")
 
     loaded_states, alignment_notes = align_loaded_states_for_comparison([load_state(path) for path in paths])
     total_maps: list[np.ndarray] = []
@@ -3854,7 +4183,7 @@ def run_transition_outcome_maps(
 
     paths = [str(Path(path).expanduser().resolve()) for path in file_paths]
     if len(paths) < 2:
-        raise ValueError("Transition Outcome Maps needs at least two chronological NetCDF files.")
+        raise ValueError("Transition Outcome Maps needs at least two chronological ARPES data files.")
 
     loaded_states, alignment_notes = align_loaded_states_for_comparison([load_state(path) for path in paths])
     labels = normalize_transition_pulse_labels(pulse_labels, len(loaded_states) - 1)
@@ -4229,7 +4558,7 @@ def run_initial_transition_feature_analysis(
 
     paths = [str(Path(path).expanduser().resolve()) for path in file_paths]
     if len(paths) < 2:
-        raise ValueError("Please provide at least two NetCDF files.")
+        raise ValueError("Please provide at least two ARPES data files.")
     if parameters.reference_index >= len(paths):
         raise ValueError("reference_index is outside the uploaded file list.")
 
@@ -6188,7 +6517,11 @@ def fit_pca(values: np.ndarray, n_components: int = 8) -> dict[str, np.ndarray]:
     _, singular_values, vh = np.linalg.svd(centered, full_matrices=False)
     components = vh[:n_components].astype(np.float32)
     explained = (singular_values ** 2) / max(1, n_samples - 1)
-    explained_ratio = (explained / explained.sum())[:n_components].astype(np.float32)
+    explained_total = float(explained.sum())
+    if explained_total <= 1e-12 or not np.isfinite(explained_total):
+        explained_ratio = np.zeros(n_components, dtype=np.float32)
+    else:
+        explained_ratio = (explained / explained_total)[:n_components].astype(np.float32)
     return {
         "mean": mean.astype(np.float32),
         "components": components,
@@ -6302,10 +6635,13 @@ def build_simple_state_maps(
     high_quantile: float = 0.70,
 ) -> tuple[list[np.ndarray], list[np.ndarray], tuple[float, float]]:
     ef_values = np.concatenate([features["ef_fraction"][valid_mask].reshape(-1) for features in features_by_state])
-    low = float(np.quantile(ef_values, low_quantile))
-    high = float(np.quantile(ef_values, high_quantile))
+    finite_ef_values = ef_values[np.isfinite(ef_values)]
+    if finite_ef_values.size == 0:
+        finite_ef_values = np.zeros(1, dtype=np.float32)
+    low = float(np.quantile(finite_ef_values, low_quantile))
+    high = float(np.quantile(finite_ef_values, high_quantile))
     if math.isclose(low, high):
-        spread = max(1e-6, float(np.std(ef_values)))
+        spread = max(1e-6, float(np.std(finite_ef_values)))
         low -= 0.5 * spread
         high += 0.5 * spread
 
