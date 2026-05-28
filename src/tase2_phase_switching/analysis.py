@@ -71,6 +71,18 @@ STATE_CLASSIFICATION_FEATURE_NAMES = (
     "Gamma_EDC",
     "S_orient",
 )
+TILT_DEFECT_LABELS = (
+    "none",
+    "high tilt",
+    "sharp tilt boundary",
+    "rough edge / dislocation",
+)
+TILT_DEFECT_COLORS = {
+    "none": "#000000",
+    "high tilt": "#fdae6b",
+    "sharp tilt boundary": "#e6550d",
+    "rough edge / dislocation": "#6a51a3",
+}
 SWITCHING_LABELS = (
     "stable / unchanged",
     "written / becomes metallic",
@@ -123,6 +135,9 @@ SWITCHING_MECHANISM_EDC_NORMALIZATIONS = (
     "near_ef",
 )
 SWITCHING_MECHANISM_SPECTRAL_FEATURES = (
+    "I_rat_A0",
+    "W_EF_A0",
+    "W_LHB_A0",
     "near_EF_intensity_A0",
     "feature_window_intensity_A0",
     "edc_peak_energy_A0",
@@ -191,6 +206,7 @@ class LoadedState:
     name: str
     file_path: str
     data_array: xr.DataArray
+    dataset: xr.Dataset | None = None
 
 
 @dataclass(slots=True)
@@ -612,6 +628,86 @@ class StateClassificationResult:
 
 
 @dataclass(slots=True)
+class TiltMapParameters:
+    band_min_ev: float = -0.30
+    band_max_ev: float = 0.05
+    phi_reference: float = 0.0
+    spatial_smooth_sigma: float = 1.0
+    defect_tilt_percentile: float = 95.0
+    defect_gradient_percentile: float = 95.0
+    low_signal_percentile: float = 8.0
+    signal_floor_fraction: float = 0.15
+    local_window: int = 5
+    group_count: int = 5
+    min_group_size: int = 8
+    epsilon: float = 1e-8
+
+    def validate(self) -> None:
+        if self.band_min_ev >= self.band_max_ev:
+            raise ValueError("band_min_ev must be smaller than band_max_ev.")
+        if self.spatial_smooth_sigma < 0:
+            raise ValueError("spatial_smooth_sigma must be non-negative.")
+        for name, value in {
+            "defect_tilt_percentile": self.defect_tilt_percentile,
+            "defect_gradient_percentile": self.defect_gradient_percentile,
+            "low_signal_percentile": self.low_signal_percentile,
+        }.items():
+            if not 0.0 <= value <= 100.0:
+                raise ValueError(f"{name} must be between 0 and 100.")
+        if self.local_window < 1:
+            raise ValueError("local_window must be at least 1.")
+        if self.group_count < 2:
+            raise ValueError("group_count must be at least 2.")
+        if self.min_group_size < 0:
+            raise ValueError("min_group_size must be non-negative.")
+        if not 0.0 <= self.signal_floor_fraction <= 1.0:
+            raise ValueError("signal_floor_fraction must be between 0 and 1.")
+        if self.epsilon <= 0:
+            raise ValueError("epsilon must be positive.")
+
+
+@dataclass(slots=True)
+class TiltMapResult:
+    state: LoadedState
+    parameters: TiltMapParameters
+    tilt_map: np.ndarray
+    peak_tilt_map: np.ndarray
+    band_weight_map: np.ndarray
+    phi_width_map: np.ndarray
+    tilt_gradient_map: np.ndarray
+    local_tilt_std_map: np.ndarray
+    defect_score_map: np.ndarray
+    group_mean_tilt_map: np.ndarray
+    defect_mask: np.ndarray
+    defect_type_map: np.ndarray
+    group_label_map: np.ndarray
+    valid_mask: np.ndarray
+    thresholds: dict[str, float]
+    group_rows: list[dict[str, Any]]
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self.tilt_map.shape
+
+    @property
+    def file_path(self) -> str:
+        return self.state.file_path
+
+    @property
+    def state_name(self) -> str:
+        return self.state.name
+
+    @property
+    def e_axis(self) -> np.ndarray:
+        return np.asarray(self.state.data_array.coords["eV"].values, dtype=np.float32)
+
+    @property
+    def phi_axis(self) -> np.ndarray:
+        return np.asarray(self.state.data_array.coords["phi"].values, dtype=np.float32)
+
+
+@dataclass(slots=True)
 class SwitchingMapResult:
     loaded_states: list[LoadedState]
     parameters: SwitchingMapParameters
@@ -783,6 +879,9 @@ class InitialTransitionFeatureParameters:
     fermi_level_ev: float = 0.0
     ef_min_ev: float = -0.05
     ef_max_ev: float = 0.05
+    lhb_center_ev: float = -0.18
+    lhb_halfwidth_ev: float = 0.05
+    smooth_sigma: float = 1.0
     feature_min_ev: float = -0.30
     feature_max_ev: float = -0.05
     asymmetry_split_ev: float = -0.15
@@ -800,6 +899,10 @@ class InitialTransitionFeatureParameters:
             raise ValueError("ef_min_ev must be smaller than ef_max_ev.")
         if self.feature_min_ev >= self.feature_max_ev:
             raise ValueError("feature_min_ev must be smaller than feature_max_ev.")
+        if self.lhb_halfwidth_ev <= 0:
+            raise ValueError("lhb_halfwidth_ev must be positive.")
+        if self.smooth_sigma < 0:
+            raise ValueError("smooth_sigma must be non-negative.")
         for name, value in {
             "metallic_percentile": self.metallic_percentile,
             "erasure_percentile": self.erasure_percentile,
@@ -2211,24 +2314,29 @@ def write_rows_to_csv(path: Path, rows: list[dict[str, Any]]) -> None:
             writer.writerow(row)
 
 
-def load_state(file_path: str) -> LoadedState:
+def load_state(file_path: str, *, load: bool = True) -> LoadedState:
     resolved = str(Path(file_path).expanduser().resolve())
     suffix = Path(resolved).suffix.lower()
+    dataset: xr.Dataset | None = None
     if suffix in TABLE_DATA_EXTENSIONS:
         data_array = load_tabular_dataarray(resolved)
     elif suffix in NUMPY_DATA_EXTENSIONS:
         data_array = load_numpy_dataarray(resolved)
     else:
         dataset = open_nc_dataset(resolved)
-        try:
-            data_array = prepare_main_dataarray(dataset).load()
-        finally:
-            dataset.close()
+        data_array = prepare_main_dataarray(dataset)
+        if load:
+            try:
+                data_array = data_array.load()
+            finally:
+                dataset.close()
+                dataset = None
 
     return LoadedState(
         name=Path(resolved).name,
         file_path=resolved,
         data_array=data_array,
+        dataset=dataset,
     )
 
 
@@ -2531,6 +2639,8 @@ def open_nc_dataset(file_path: str) -> xr.Dataset:
         try:
             if engine is None:
                 dataset = xr.open_dataset(file_path)
+            elif engine == "h5netcdf":
+                dataset = xr.open_dataset(file_path, engine=engine, chunks="auto")
             else:
                 dataset = xr.open_dataset(file_path, engine=engine)
             if dataset.data_vars:
@@ -2538,7 +2648,7 @@ def open_nc_dataset(file_path: str) -> xr.Dataset:
             dataset.close()
             if engine == "h5netcdf":
                 for group in numeric_hdf5_groups(file_path):
-                    grouped = xr.open_dataset(file_path, engine=engine, group=group)
+                    grouped = xr.open_dataset(file_path, engine=engine, group=group, chunks="auto")
                     if grouped.data_vars:
                         return grouped
                     grouped.close()
@@ -3512,6 +3622,396 @@ def export_state_classification(result: StateClassificationResult, output_dir: s
         "code_map": code_map_path,
         "summary": summary_path,
         "feature_maps": feature_dir,
+    }
+
+
+def run_tilt_map(
+    file_path: str | Path,
+    parameters: TiltMapParameters | None = None,
+) -> TiltMapResult:
+    if parameters is None:
+        parameters = TiltMapParameters()
+    parameters.validate()
+    state = load_state(str(file_path), load=False)
+    return compute_tilt_map_for_state(state, parameters)
+
+
+def compute_tilt_map_for_state(
+    state: LoadedState,
+    parameters: TiltMapParameters,
+) -> TiltMapResult:
+    parameters.validate()
+    da, energy_axis, phi_axis = sorted_required_dataarray(state.data_array)
+    band_mask = _energy_window_mask(energy_axis, parameters.band_min_ev, parameters.band_max_ev)
+    if not np.any(band_mask):
+        raise ValueError(
+            f"No eV samples were found inside the tilt band window "
+            f"{parameters.band_min_ev:g} to {parameters.band_max_ev:g} eV."
+        )
+
+    band = da.isel(eV=np.flatnonzero(band_mask)).fillna(0)
+    if int(np.count_nonzero(band_mask)) > 1:
+        mdc_da = band.integrate(coord="eV")
+    else:
+        mdc_da = band.sum(dim="eV", skipna=True)
+    mdc = np.asarray(mdc_da.values, dtype=np.float32)
+    mdc[~np.isfinite(mdc)] = 0.0
+
+    baseline = np.nanpercentile(mdc, 10, axis=2, keepdims=True) if mdc.shape[2] > 1 else 0.0
+    weights = np.clip(mdc - baseline, a_min=0.0, a_max=None).astype(np.float32)
+    if not np.any(weights > parameters.epsilon):
+        weights = np.clip(mdc, a_min=0.0, a_max=None).astype(np.float32)
+
+    band_weight = integrate_phi_profiles(weights, phi_axis).astype(np.float32)
+    peak_index = np.argmax(weights, axis=2)
+    phi_peak = phi_axis[np.clip(peak_index, 0, max(0, phi_axis.size - 1))].astype(np.float32)
+    phi_center = weighted_phi_center(weights, phi_axis, parameters.epsilon).astype(np.float32)
+    phi_width = weighted_phi_width(weights, phi_axis, phi_center, parameters.epsilon).astype(np.float32)
+
+    percentile_signal_threshold = finite_percentile(band_weight, parameters.low_signal_percentile)
+    high_signal_reference = finite_percentile(band_weight, 98.0)
+    signal_floor_threshold = (
+        float(high_signal_reference) * float(parameters.signal_floor_fraction)
+        if np.isfinite(high_signal_reference)
+        else float("nan")
+    )
+    low_signal_threshold = np.nanmax([percentile_signal_threshold, signal_floor_threshold])
+    if not np.isfinite(low_signal_threshold):
+        low_signal_threshold = percentile_signal_threshold
+    valid_mask = np.isfinite(phi_center) & np.isfinite(band_weight) & (band_weight > low_signal_threshold)
+    valid_mask = clean_connected_components(valid_mask, max(1, parameters.min_group_size))
+    tilt = (phi_center - float(parameters.phi_reference)).astype(np.float32)
+    peak_tilt = (phi_peak - float(parameters.phi_reference)).astype(np.float32)
+    tilt[~valid_mask] = np.nan
+    peak_tilt[~valid_mask] = np.nan
+    phi_width[~valid_mask] = np.nan
+
+    filled_tilt = fill_with_median(tilt)
+    if parameters.spatial_smooth_sigma > 0:
+        smooth_tilt = ndimage.gaussian_filter(filled_tilt, sigma=parameters.spatial_smooth_sigma, mode="nearest").astype(np.float32)
+    else:
+        smooth_tilt = filled_tilt.astype(np.float32)
+    smooth_tilt[~valid_mask] = np.nan
+    tilt_gradient = _gradient_magnitude(smooth_tilt)
+    tilt_gradient[~valid_mask] = np.nan
+    local_std = local_nan_std(smooth_tilt, valid_mask, parameters.local_window)
+
+    abs_tilt = np.abs(tilt)
+    tilt_threshold = finite_percentile(abs_tilt[valid_mask], parameters.defect_tilt_percentile)
+    gradient_threshold = finite_percentile(tilt_gradient[valid_mask], parameters.defect_gradient_percentile)
+    local_std_threshold = finite_percentile(local_std[valid_mask], parameters.defect_gradient_percentile)
+    width_threshold = finite_percentile(phi_width[valid_mask], parameters.defect_gradient_percentile)
+
+    high_tilt = valid_mask & (abs_tilt >= tilt_threshold)
+    sharp_boundary = valid_mask & (tilt_gradient >= gradient_threshold)
+    rough_or_dislocation = valid_mask & ((local_std >= local_std_threshold) | (phi_width >= width_threshold))
+
+    defect_type_map = np.zeros(tilt.shape, dtype=np.int8)
+    defect_type_map[high_tilt] = 1
+    defect_type_map[sharp_boundary] = 2
+    defect_type_map[rough_or_dislocation] = 3
+    defect_mask = defect_type_map > 0
+    defect_score = robust_normalize_map(abs_tilt) + robust_normalize_map(tilt_gradient) + robust_normalize_map(local_std)
+    defect_score = np.asarray(defect_score / 3.0, dtype=np.float32)
+    defect_score[~valid_mask] = np.nan
+
+    group_label_map, group_rows = build_tilt_group_map(
+        smooth_tilt,
+        valid_mask,
+        defect_mask,
+        tilt_gradient,
+        phi_width,
+        parameters.group_count,
+        parameters.min_group_size,
+    )
+    group_rows.extend(build_tilt_defect_rows(defect_type_map, tilt, tilt_gradient, local_std, phi_width))
+    group_mean_tilt = build_group_mean_tilt_map(group_label_map, group_rows)
+
+    thresholds = {
+        "low_signal_band_weight": float(low_signal_threshold),
+        "percentile_low_signal_band_weight": float(percentile_signal_threshold),
+        "signal_floor_band_weight": float(signal_floor_threshold),
+        "high_abs_tilt": float(tilt_threshold),
+        "high_tilt_gradient": float(gradient_threshold),
+        "high_local_tilt_std": float(local_std_threshold),
+        "high_phi_width": float(width_threshold),
+    }
+    notes = [
+        "Tilt is computed as the intensity-weighted phi center of the selected ARPES band window minus the phi reference.",
+        "Sharp boundary defects are high spatial gradients in the local tilt map; rough/dislocation defects are high local tilt variance or broad phi profiles.",
+    ]
+    return TiltMapResult(
+        state=state,
+        parameters=parameters,
+        tilt_map=tilt,
+        peak_tilt_map=peak_tilt,
+        band_weight_map=band_weight,
+        phi_width_map=phi_width,
+        tilt_gradient_map=tilt_gradient,
+        local_tilt_std_map=local_std,
+        defect_score_map=defect_score,
+        group_mean_tilt_map=group_mean_tilt,
+        defect_mask=defect_mask,
+        defect_type_map=defect_type_map,
+        group_label_map=group_label_map,
+        valid_mask=valid_mask,
+        thresholds=thresholds,
+        group_rows=group_rows,
+        notes=notes,
+    )
+
+
+def integrate_phi_profiles(values: np.ndarray, phi_axis: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float32)
+    phi = np.asarray(phi_axis, dtype=np.float32)
+    if phi.size > 1:
+        return np.trapezoid(arr, x=phi, axis=2).astype(np.float32)
+    return np.sum(arr, axis=2).astype(np.float32)
+
+
+def weighted_phi_center(values: np.ndarray, phi_axis: np.ndarray, epsilon: float) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float32)
+    phi = np.asarray(phi_axis, dtype=np.float32)
+    denominator = integrate_phi_profiles(arr, phi)
+    if phi.size > 1:
+        numerator = np.trapezoid(arr * phi[None, None, :], x=phi, axis=2)
+    else:
+        numerator = np.sum(arr * phi[None, None, :], axis=2)
+    out = np.divide(
+        numerator,
+        denominator,
+        out=np.full(denominator.shape, np.nan, dtype=np.float32),
+        where=np.abs(denominator) > epsilon,
+    )
+    return out.astype(np.float32)
+
+
+def weighted_phi_width(values: np.ndarray, phi_axis: np.ndarray, center: np.ndarray, epsilon: float) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float32)
+    phi = np.asarray(phi_axis, dtype=np.float32)
+    denominator = integrate_phi_profiles(arr, phi)
+    delta = phi[None, None, :] - np.asarray(center, dtype=np.float32)[:, :, None]
+    if phi.size > 1:
+        numerator = np.trapezoid(arr * delta * delta, x=phi, axis=2)
+    else:
+        numerator = np.sum(arr * delta * delta, axis=2)
+    variance = np.divide(
+        numerator,
+        denominator,
+        out=np.full(denominator.shape, np.nan, dtype=np.float32),
+        where=np.abs(denominator) > epsilon,
+    )
+    return np.sqrt(np.clip(variance, 0.0, None)).astype(np.float32)
+
+
+def fill_with_median(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float32)
+    finite = arr[np.isfinite(arr)]
+    fill = float(np.nanmedian(finite)) if finite.size else 0.0
+    return finite_fill(arr, fill).astype(np.float32)
+
+
+def local_nan_std(values: np.ndarray, valid_mask: np.ndarray, window: int) -> np.ndarray:
+    valid = np.asarray(valid_mask, dtype=np.float32)
+    size = max(1, int(window))
+    filled = finite_fill(values, 0.0).astype(np.float32)
+    count = ndimage.uniform_filter(valid, size=size, mode="nearest")
+    mean = ndimage.uniform_filter(filled * valid, size=size, mode="nearest") / np.maximum(count, 1e-6)
+    mean_sq = ndimage.uniform_filter(filled * filled * valid, size=size, mode="nearest") / np.maximum(count, 1e-6)
+    out = np.sqrt(np.clip(mean_sq - mean * mean, 0.0, None)).astype(np.float32)
+    out[count <= 1e-6] = np.nan
+    return out
+
+
+def build_tilt_group_map(
+    tilt_map: np.ndarray,
+    valid_mask: np.ndarray,
+    defect_mask: np.ndarray,
+    gradient_map: np.ndarray,
+    phi_width_map: np.ndarray,
+    group_count: int,
+    min_group_size: int,
+) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    group_base = np.asarray(valid_mask, dtype=bool) & ~np.asarray(defect_mask, dtype=bool) & np.isfinite(tilt_map)
+    group_label_map = np.zeros(np.asarray(tilt_map).shape, dtype=np.int16)
+    values = np.asarray(tilt_map, dtype=np.float32)[group_base]
+    if values.size == 0:
+        return group_label_map, []
+
+    quantiles = np.linspace(0.0, 100.0, max(2, int(group_count)) + 1)
+    edges = np.unique(np.nanpercentile(values, quantiles))
+    if edges.size < 2:
+        edges = np.asarray([float(np.nanmin(values)) - 1e-6, float(np.nanmax(values)) + 1e-6], dtype=np.float32)
+
+    label_index = 1
+    rows: list[dict[str, Any]] = []
+    bins = np.digitize(np.asarray(tilt_map, dtype=np.float32), edges[1:-1], right=False)
+    for bin_index in range(edges.size - 1):
+        mask = group_base & (bins == bin_index)
+        if not np.any(mask):
+            continue
+        cleaned = clean_connected_components(mask, min_group_size)
+        labels, count = ndimage.label(cleaned)
+        for component_index in range(1, count + 1):
+            component = labels == component_index
+            pixel_count = int(np.count_nonzero(component))
+            if pixel_count < max(1, min_group_size):
+                continue
+            group_label_map[component] = label_index
+            xs, ys = np.where(component)
+            mean_tilt = float(np.nanmean(np.asarray(tilt_map)[component]))
+            label = "positive-tilted terrace" if mean_tilt > 0 else "negative-tilted terrace" if mean_tilt < 0 else "near-flat terrace"
+            rows.append(
+                {
+                    "group_id": int(label_index),
+                    "group_type": label,
+                    "tilt_bin": int(bin_index),
+                    "pixel_count": pixel_count,
+                    "mean_tilt_phi": mean_tilt,
+                    "mean_abs_tilt_phi": float(np.nanmean(np.abs(np.asarray(tilt_map)[component]))),
+                    "mean_tilt_gradient": float(np.nanmean(np.asarray(gradient_map)[component])),
+                    "mean_phi_width": float(np.nanmean(np.asarray(phi_width_map)[component])),
+                    "x_min": int(np.nanmin(xs)),
+                    "x_max": int(np.nanmax(xs)),
+                    "y_min": int(np.nanmin(ys)),
+                    "y_max": int(np.nanmax(ys)),
+                }
+            )
+            label_index += 1
+    return group_label_map, rows
+
+
+def build_tilt_defect_rows(
+    defect_type_map: np.ndarray,
+    tilt_map: np.ndarray,
+    gradient_map: np.ndarray,
+    local_std_map: np.ndarray,
+    phi_width_map: np.ndarray,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for code, label in enumerate(TILT_DEFECT_LABELS):
+        if code == 0:
+            continue
+        labels, count = ndimage.label(np.asarray(defect_type_map) == code)
+        for component_index in range(1, count + 1):
+            component = labels == component_index
+            pixel_count = int(np.count_nonzero(component))
+            if pixel_count == 0:
+                continue
+            xs, ys = np.where(component)
+            rows.append(
+                {
+                    "group_id": int(-1000 * code - component_index),
+                    "group_type": label,
+                    "tilt_bin": -1,
+                    "pixel_count": pixel_count,
+                    "mean_tilt_phi": float(np.nanmean(np.asarray(tilt_map)[component])),
+                    "mean_abs_tilt_phi": float(np.nanmean(np.abs(np.asarray(tilt_map)[component]))),
+                    "mean_tilt_gradient": float(np.nanmean(np.asarray(gradient_map)[component])),
+                    "mean_local_tilt_std": float(np.nanmean(np.asarray(local_std_map)[component])),
+                    "mean_phi_width": float(np.nanmean(np.asarray(phi_width_map)[component])),
+                    "x_min": int(np.nanmin(xs)),
+                    "x_max": int(np.nanmax(xs)),
+                    "y_min": int(np.nanmin(ys)),
+                    "y_max": int(np.nanmax(ys)),
+                }
+            )
+    return rows
+
+
+def build_group_mean_tilt_map(group_label_map: np.ndarray, group_rows: list[dict[str, Any]]) -> np.ndarray:
+    label_map = np.asarray(group_label_map)
+    out = np.full(label_map.shape, np.nan, dtype=np.float32)
+    for row in group_rows:
+        group_id = int(row.get("group_id", 0))
+        if group_id <= 0:
+            continue
+        mean_tilt = row.get("mean_tilt_phi")
+        if mean_tilt is None:
+            continue
+        out[label_map == group_id] = float(mean_tilt)
+    return out
+
+
+def tilt_map_table_rows(result: TiltMapResult) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    x_size, y_size = result.shape
+    for x_index in range(x_size):
+        for y_index in range(y_size):
+            defect_code = int(result.defect_type_map[x_index, y_index])
+            rows.append(
+                {
+                    "x": x_index,
+                    "y": y_index,
+                    "valid": bool(result.valid_mask[x_index, y_index]),
+                    "tilt_phi": float(result.tilt_map[x_index, y_index]),
+                    "peak_tilt_phi": float(result.peak_tilt_map[x_index, y_index]),
+                    "band_weight": float(result.band_weight_map[x_index, y_index]),
+                    "phi_width": float(result.phi_width_map[x_index, y_index]),
+                    "tilt_gradient": float(result.tilt_gradient_map[x_index, y_index]),
+                    "local_tilt_std": float(result.local_tilt_std_map[x_index, y_index]),
+                    "defect_score": float(result.defect_score_map[x_index, y_index]),
+                    "defect_code": defect_code,
+                    "defect_label": TILT_DEFECT_LABELS[defect_code],
+                    "tilt_group_id": int(result.group_label_map[x_index, y_index]),
+                    "region_mean_tilt_phi": float(result.group_mean_tilt_map[x_index, y_index]),
+                }
+            )
+    return rows
+
+
+def export_tilt_map(result: TiltMapResult, output_dir: str | Path) -> dict[str, Path]:
+    output_path = Path(output_dir).expanduser().resolve()
+    output_path.mkdir(parents=True, exist_ok=True)
+    maps_dir = output_path / "tilt_maps"
+    maps_dir.mkdir(parents=True, exist_ok=True)
+
+    map_values = {
+        "tilt_phi": result.tilt_map,
+        "peak_tilt_phi": result.peak_tilt_map,
+        "band_weight": result.band_weight_map,
+        "phi_width": result.phi_width_map,
+        "tilt_gradient": result.tilt_gradient_map,
+        "local_tilt_std": result.local_tilt_std_map,
+        "defect_score": result.defect_score_map,
+        "region_mean_tilt_phi": result.group_mean_tilt_map,
+        "defect_mask": result.defect_mask.astype(np.int8),
+        "defect_type_map": result.defect_type_map,
+        "tilt_group_map": result.group_label_map,
+        "valid_mask": result.valid_mask.astype(np.int8),
+    }
+    for name, values in map_values.items():
+        np.save(maps_dir / f"{name}.npy", values)
+
+    pixel_table = output_path / "tilt_map_pixels.csv"
+    group_table = output_path / "tilt_map_groups.csv"
+    parameters_path = output_path / "tilt_map_parameters.json"
+    summary_path = output_path / "tilt_map_summary.json"
+    write_rows_to_csv(pixel_table, tilt_map_table_rows(result))
+    write_rows_to_csv(group_table, result.group_rows)
+    parameters_path.write_text(json.dumps(asdict(result.parameters), indent=2), encoding="utf-8")
+    summary_path.write_text(
+        json.dumps(
+            {
+                "file": result.file_path,
+                "state_name": result.state_name,
+                "shape": {"x": int(result.shape[0]), "y": int(result.shape[1])},
+                "thresholds": result.thresholds,
+                "valid_pixels": int(np.count_nonzero(result.valid_mask)),
+                "defect_pixels": int(np.count_nonzero(result.defect_mask)),
+                "groups": len(result.group_rows),
+                "notes": result.notes,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "maps": maps_dir,
+        "pixel_table": pixel_table,
+        "group_table": group_table,
+        "parameters": parameters_path,
+        "summary": summary_path,
     }
 
 
@@ -4585,7 +5085,7 @@ def run_initial_transition_feature_analysis(
     initial_features = extract_initial_state_features(reference, parameters)
     initial_near_ef = initial_features["near_EF_intensity_A0"]
     initial_feature = initial_features["feature_window_intensity_A0"]
-    valid_mask = np.isfinite(initial_near_ef) & np.isfinite(initial_feature)
+    valid_mask = np.isfinite(initial_near_ef) & np.isfinite(initial_feature) & np.isfinite(initial_features["I_rat_A0"])
 
     future_metallic = build_future_metallic_mask(aggregate_maps)
     future_erased = build_future_erased_mask(aggregate_maps)
@@ -4619,8 +5119,8 @@ def run_initial_transition_feature_analysis(
     if parameters.normalization_mode != "none":
         notes.append(f"Applied per-file normalization mode: {parameters.normalization_mode}.")
     notes.append(
-        "metallic_count counts transitions where a pixel gained near-Fermi spectral weight; "
-        "erased_count counts transitions where a pixel lost feature-window spectral weight."
+        "metallic_count counts transitions where a pixel gained I_rat = W_EF / W_LHB; "
+        "erased_count counts transitions where I_rat decreased, marking pixels whose metallicity was erased."
     )
     return InitialTransitionFeatureResult(
         loaded_states=normalized_states,
@@ -4652,7 +5152,7 @@ def load_transition_file_sequence(file_paths: list[str] | tuple[str, ...]) -> tu
     and clustering panels.
     """
 
-    return align_loaded_states_for_comparison([load_state(path) for path in file_paths])
+    return align_loaded_states_for_comparison([load_state(path, load=False) for path in file_paths])
 
 
 def normalize_transition_states(
@@ -4733,6 +5233,78 @@ def compute_integrated_intensity(
     return np.sum(phi_integrated, axis=2).astype(np.float32)
 
 
+def sorted_required_dataarray(da: xr.DataArray) -> tuple[xr.DataArray, np.ndarray, np.ndarray]:
+    require_dims(da)
+    ordered = da.transpose(*REQUIRED_DIMS)
+    energy_axis = np.asarray(ordered.coords["eV"].values, dtype=np.float32)
+    phi_axis = np.asarray(ordered.coords["phi"].values, dtype=np.float32)
+    energy_order = np.argsort(energy_axis)
+    phi_order = np.argsort(phi_axis)
+    if not np.array_equal(energy_order, np.arange(energy_axis.size)):
+        ordered = ordered.isel(eV=energy_order)
+        energy_axis = energy_axis[energy_order]
+    if not np.array_equal(phi_order, np.arange(phi_axis.size)):
+        ordered = ordered.isel(phi=phi_order)
+        phi_axis = phi_axis[phi_order]
+    return ordered, energy_axis, phi_axis
+
+
+def integrate_dataarray_phi(da: xr.DataArray) -> tuple[np.ndarray, np.ndarray]:
+    ordered, energy_axis, phi_axis = sorted_required_dataarray(da)
+    if phi_axis.size > 1:
+        edc = ordered.fillna(0).integrate(coord="phi")
+    else:
+        edc = ordered.sum(dim="phi", skipna=True)
+    return np.asarray(edc.values, dtype=np.float32), energy_axis
+
+
+def integrate_dataarray_phi_energy_range(
+    da: xr.DataArray,
+    low: float,
+    high: float,
+    padding_ev: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    ordered, energy_axis, phi_axis = sorted_required_dataarray(da)
+    padded_low = min(low, high) - max(0.0, float(padding_ev))
+    padded_high = max(low, high) + max(0.0, float(padding_ev))
+    mask = (energy_axis >= padded_low) & (energy_axis <= padded_high)
+    if not np.any(mask):
+        center = 0.5 * (low + high)
+        mask[int(np.argmin(np.abs(energy_axis - center)))] = True
+    subset = ordered.isel(eV=np.flatnonzero(mask))
+    if phi_axis.size > 1:
+        edc = subset.fillna(0).integrate(coord="phi")
+    else:
+        edc = subset.sum(dim="phi", skipna=True)
+    return np.asarray(edc.values, dtype=np.float32), energy_axis[mask]
+
+
+def integrate_dataarray_energy_window(
+    da: xr.DataArray,
+    energy_window: tuple[float, float],
+) -> tuple[np.ndarray, np.ndarray]:
+    ordered, energy_axis, phi_axis = sorted_required_dataarray(da)
+    mask = (energy_axis >= min(energy_window)) & (energy_axis <= max(energy_window))
+    if not np.any(mask):
+        mask[int(np.argmin(np.abs(energy_axis - np.mean(energy_window))))] = True
+    subset = ordered.isel(eV=np.flatnonzero(mask))
+    if int(np.count_nonzero(mask)) > 1:
+        mdc = subset.fillna(0).integrate(coord="eV")
+    else:
+        mdc = subset.sum(dim="eV", skipna=True)
+    return np.asarray(mdc.values, dtype=np.float32), phi_axis
+
+
+def compute_integrated_intensity_dataarray(
+    da: xr.DataArray,
+    energy_window: tuple[float, float],
+) -> np.ndarray:
+    mdc, phi_axis = integrate_dataarray_energy_window(da, energy_window)
+    if phi_axis.size > 1:
+        return np.trapezoid(mdc, x=phi_axis, axis=2).astype(np.float32)
+    return np.sum(mdc, axis=2).astype(np.float32)
+
+
 def compute_transition_metrics_for_pair(
     state_a: LoadedState,
     state_b: LoadedState,
@@ -4741,20 +5313,12 @@ def compute_transition_metrics_for_pair(
     after_index: int,
     parameters: InitialTransitionFeatureParameters,
 ) -> InitialTransitionPairMetrics:
-    energy_axis = np.asarray(state_a.data_array.coords["eV"].values, dtype=np.float32)
-    phi_axis = np.asarray(state_a.data_array.coords["phi"].values, dtype=np.float32)
-    a = np.asarray(state_a.data_array.values, dtype=np.float32)
-    b = np.asarray(state_b.data_array.values, dtype=np.float32)
-
-    ef_window = (parameters.fermi_level_ev + parameters.ef_min_ev, parameters.fermi_level_ev + parameters.ef_max_ev)
-    feature_window = (parameters.feature_min_ev, parameters.feature_max_ev)
-    a_ef = compute_integrated_intensity(a, energy_axis, phi_axis, ef_window)
-    b_ef = compute_integrated_intensity(b, energy_axis, phi_axis, ef_window)
-    a_feature = compute_integrated_intensity(a, energy_axis, phi_axis, feature_window)
-    b_feature = compute_integrated_intensity(b, energy_axis, phi_axis, feature_window)
-    metallicity_score = (b_ef - a_ef).astype(np.float32)
-    erasure_score = (a_feature - b_feature).astype(np.float32)
-    transition_magnitude = np.sqrt(np.nanmean((b - a) ** 2, axis=(2, 3))).astype(np.float32)
+    a_features = compute_initial_transition_core_feature_maps(state_a.data_array, parameters)
+    b_features = compute_initial_transition_core_feature_maps(state_b.data_array, parameters)
+    delta_irat = (b_features["I_rat"] - a_features["I_rat"]).astype(np.float32)
+    metallicity_score = delta_irat
+    erasure_score = (-delta_irat).astype(np.float32)
+    transition_magnitude = np.abs(delta_irat).astype(np.float32)
 
     metallicity_norm = robust_zscore_map(metallicity_score)
     erasure_norm = robust_zscore_map(erasure_score)
@@ -4789,6 +5353,94 @@ def compute_transition_metrics_for_pair(
     )
 
 
+def compute_initial_transition_core_feature_maps(
+    da: xr.DataArray,
+    parameters: InitialTransitionFeatureParameters,
+) -> dict[str, np.ndarray]:
+    parameters.validate()
+    ef_window = (
+        parameters.fermi_level_ev + parameters.ef_min_ev,
+        parameters.fermi_level_ev + parameters.ef_max_ev,
+    )
+    lhb_window = (
+        parameters.lhb_center_ev - parameters.lhb_halfwidth_ev,
+        parameters.lhb_center_ev + parameters.lhb_halfwidth_ev,
+    )
+    _, energy_axis, _ = sorted_required_dataarray(da)
+    if energy_axis.size > 1:
+        steps = np.abs(np.diff(energy_axis))
+        steps = steps[np.isfinite(steps) & (steps > 0)]
+        energy_padding = float(np.nanmedian(steps)) * max(0.0, parameters.smooth_sigma) * 3.0 if steps.size else 0.0
+    else:
+        energy_padding = 0.0
+    w_ef = compute_smoothed_dataarray_window_weight(da, ef_window, parameters.smooth_sigma, energy_padding)
+    w_lhb = compute_smoothed_dataarray_window_weight(da, lhb_window, parameters.smooth_sigma, energy_padding)
+    return {
+        "T": (w_ef + w_lhb).astype(np.float32),
+        "W_EF": w_ef,
+        "W_LHB": w_lhb,
+        "I_rat": safe_divide(w_ef, w_lhb, eps=parameters.epsilon).astype(np.float32),
+    }
+
+
+def compute_smoothed_dataarray_window_weight(
+    da: xr.DataArray,
+    energy_window: tuple[float, float],
+    smooth_sigma: float,
+    padding_ev: float,
+) -> np.ndarray:
+    edc, energy_axis = integrate_dataarray_phi_energy_range(
+        da,
+        min(energy_window),
+        max(energy_window),
+        padding_ev=padding_ev,
+    )
+    smoothed_edc = (
+        ndimage.gaussian_filter1d(edc, sigma=smooth_sigma, axis=2, mode="nearest")
+        if smooth_sigma > 0
+        else edc
+    ).astype(np.float32)
+    mask = (energy_axis >= min(energy_window)) & (energy_axis <= max(energy_window))
+    if not np.any(mask):
+        raise ValueError(f"No eV samples were found inside energy window {energy_window}.")
+    return _integrate_window(smoothed_edc, energy_axis, mask).astype(np.float32)
+
+
+def compute_initial_transition_core_feature_maps_from_edc(
+    edc: np.ndarray,
+    energy_axis: np.ndarray,
+    parameters: InitialTransitionFeatureParameters,
+) -> dict[str, np.ndarray]:
+    smoothed_edc = (
+        ndimage.gaussian_filter1d(edc, sigma=parameters.smooth_sigma, axis=2, mode="nearest")
+        if parameters.smooth_sigma > 0
+        else edc
+    ).astype(np.float32)
+    total_intensity = _integrate_along_axis(edc, energy_axis, axis=2).astype(np.float32)
+    ef_mask = _energy_window_mask(
+        energy_axis,
+        parameters.fermi_level_ev + parameters.ef_min_ev,
+        parameters.fermi_level_ev + parameters.ef_max_ev,
+    )
+    lhb_mask = get_energy_mask(
+        energy_axis,
+        center=parameters.lhb_center_ev,
+        halfwidth=parameters.lhb_halfwidth_ev,
+    )
+    if not ef_mask.any():
+        raise ValueError("No energy samples were found inside the near-EF I_rat window.")
+    if not lhb_mask.any():
+        raise ValueError("No energy samples were found inside the LHB/p1 I_rat window.")
+    w_ef = _integrate_window(smoothed_edc, energy_axis, ef_mask).astype(np.float32)
+    w_lhb = _integrate_window(smoothed_edc, energy_axis, lhb_mask).astype(np.float32)
+    return {
+        "T": total_intensity,
+        "W_EF": w_ef,
+        "W_LHB": w_lhb,
+        "I_rat": safe_divide(w_ef, w_lhb, eps=parameters.epsilon).astype(np.float32),
+    }
+
+
 def classify_transition_map(
     metallicity_score: np.ndarray,
     erasure_score: np.ndarray,
@@ -4802,11 +5454,11 @@ def classify_transition_map(
     erased = np.asarray(erasure_score, dtype=np.float32)
     magnitude = np.asarray(transition_magnitude, dtype=np.float32)
     valid = np.isfinite(metallic) & np.isfinite(erased) & np.isfinite(magnitude)
-    metallic_threshold = finite_percentile(metallic[valid], metallicity_percentile)
-    erasure_threshold = finite_percentile(erased[valid], erasure_percentile)
+    metallic_threshold = finite_percentile(metallic[valid & (metallic > 0)], metallicity_percentile)
+    erasure_threshold = finite_percentile(erased[valid & (erased > 0)], erasure_percentile)
     stable_threshold = finite_percentile(magnitude[valid], stable_percentile)
-    metallic_mask = valid & (metallic > metallic_threshold)
-    erased_mask = valid & (erased > erasure_threshold)
+    metallic_mask = valid & (metallic > 0) & (metallic > metallic_threshold)
+    erased_mask = valid & (erased > 0) & (erased > erasure_threshold)
     stable_mask = valid & (magnitude < stable_threshold)
     if not allow_overlap:
         both = metallic_mask & erased_mask
@@ -4883,16 +5535,21 @@ def extract_initial_state_features(
     initial_state: LoadedState,
     parameters: InitialTransitionFeatureParameters,
 ) -> dict[str, np.ndarray]:
-    values = np.asarray(initial_state.data_array.values, dtype=np.float32)
-    energy_axis = np.asarray(initial_state.data_array.coords["eV"].values, dtype=np.float32)
-    phi_axis = np.asarray(initial_state.data_array.coords["phi"].values, dtype=np.float32)
+    edc, energy_axis = integrate_dataarray_phi(initial_state.data_array)
     ef_window = (parameters.fermi_level_ev + parameters.ef_min_ev, parameters.fermi_level_ev + parameters.ef_max_ev)
     feature_window = (parameters.feature_min_ev, parameters.feature_max_ev)
-    near_ef = compute_integrated_intensity(values, energy_axis, phi_axis, ef_window)
-    feature = compute_integrated_intensity(values, energy_axis, phi_axis, feature_window)
-    total = compute_integrated_intensity(values, energy_axis, phi_axis, (float(np.nanmin(energy_axis)), float(np.nanmax(energy_axis))))
-    edc = integrate_phi(values, phi_axis)
-    mdc = integrate_energy_window(values, energy_axis, ef_window)
+    ef_mask = (energy_axis >= min(ef_window)) & (energy_axis <= max(ef_window))
+    if not np.any(ef_mask):
+        raise ValueError(f"No eV samples were found inside energy window {ef_window}.")
+    feature_mask_for_intensity = (energy_axis >= min(feature_window)) & (energy_axis <= max(feature_window))
+    if not np.any(feature_mask_for_intensity):
+        raise ValueError(f"No eV samples were found inside energy window {feature_window}.")
+    total_mask = np.isfinite(energy_axis)
+    near_ef = _integrate_window(edc, energy_axis, ef_mask).astype(np.float32)
+    feature = _integrate_window(edc, energy_axis, feature_mask_for_intensity).astype(np.float32)
+    total = _integrate_window(edc, energy_axis, total_mask).astype(np.float32)
+    core_features = compute_initial_transition_core_feature_maps_from_edc(edc, energy_axis, parameters)
+    mdc, phi_axis = integrate_dataarray_energy_window(initial_state.data_array, ef_window)
     x_size, y_size = near_ef.shape
 
     peak_energy = np.full((x_size, y_size), np.nan, dtype=np.float32)
@@ -4902,7 +5559,7 @@ def extract_initial_state_features(
     asymmetry = np.full((x_size, y_size), np.nan, dtype=np.float32)
     mdc_peak_pos = np.full((x_size, y_size), np.nan, dtype=np.float32)
     mdc_peak_width = np.full((x_size, y_size), np.nan, dtype=np.float32)
-    feature_mask = (energy_axis >= min(feature_window)) & (energy_axis <= max(feature_window))
+    feature_mask = feature_mask_for_intensity
     low_mask = energy_axis < parameters.asymmetry_split_ev
     high_mask = energy_axis >= parameters.asymmetry_split_ev
 
@@ -4941,6 +5598,9 @@ def extract_initial_state_features(
     local_sq = ndimage.uniform_filter(finite_fill(near_ef, 0.0) ** 2, size=3, mode="nearest")
     local_std = np.sqrt(np.clip(local_sq - local_mean * local_mean, 0.0, None)).astype(np.float32)
     return {
+        "I_rat_A0": core_features["I_rat"].astype(np.float32),
+        "W_EF_A0": core_features["W_EF"].astype(np.float32),
+        "W_LHB_A0": core_features["W_LHB"].astype(np.float32),
         "near_EF_intensity_A0": near_ef.astype(np.float32),
         "feature_window_intensity_A0": feature.astype(np.float32),
         "edc_peak_energy_A0": peak_energy,
@@ -5026,11 +5686,11 @@ def compute_initial_group_average_spectra(
     group_masks: dict[str, np.ndarray],
     parameters: InitialTransitionFeatureParameters,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
-    values = np.asarray(initial_state.data_array.values, dtype=np.float32)
-    phi_axis = np.asarray(initial_state.data_array.coords["phi"].values, dtype=np.float32)
-    energy_axis = np.asarray(initial_state.data_array.coords["eV"].values, dtype=np.float32)
-    edc = integrate_phi(values, phi_axis)
-    mdc = integrate_energy_window(values, energy_axis, (parameters.fermi_level_ev + parameters.ef_min_ev, parameters.fermi_level_ev + parameters.ef_max_ev))
+    edc, energy_axis = integrate_dataarray_phi(initial_state.data_array)
+    mdc, phi_axis = integrate_dataarray_energy_window(
+        initial_state.data_array,
+        (parameters.fermi_level_ev + parameters.ef_min_ev, parameters.fermi_level_ev + parameters.ef_max_ev),
+    )
     average_edcs: dict[str, np.ndarray] = {}
     average_mdcs: dict[str, np.ndarray] = {}
     for group, mask in group_masks.items():
@@ -5051,6 +5711,9 @@ def compute_group_statistics(
     rows: list[dict[str, Any]] = []
     stable_mask = np.asarray(group_masks.get("stable", np.zeros_like(next(iter(initial_features.values())), dtype=bool)), dtype=bool)
     key_features = [
+        "I_rat_A0",
+        "W_EF_A0",
+        "W_LHB_A0",
         "near_EF_intensity_A0",
         "feature_window_intensity_A0",
         "edc_peak_energy_A0",
@@ -5299,7 +5962,7 @@ def run_switching_mechanism_diagnostics(
         artifact_rows,
     )
     notes = [
-        "Switching Mechanism Diagnostics reuses the Initial State Transition Features labels so every pixel label remains traceable to transition scores and thresholds.",
+        "Switching Mechanism Diagnostics reuses the I_rat transition labels so every pixel label remains traceable to Delta I_rat scores and thresholds.",
         "Evidence scores are heuristic diagnostics, not proof of a mechanism.",
     ]
     return SwitchingMechanismDiagnosticsResult(

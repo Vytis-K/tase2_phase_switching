@@ -24,6 +24,7 @@ matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 import matplotlib.colors as mcolors
+import matplotlib.patheffects as path_effects
 import numpy as np
 
 from .analysis import (
@@ -42,6 +43,8 @@ from .analysis import (
     SWITCHING_COLORS,
     SWITCHING_LABELS,
     SWITCHING_MECHANISM_EDC_NORMALIZATIONS,
+    TILT_DEFECT_COLORS,
+    TILT_DEFECT_LABELS,
     TRANSITION_OUTCOME_COLORS,
     TRANSITION_OUTCOME_LABELS,
     SpectralClusterParameters,
@@ -54,6 +57,8 @@ from .analysis import (
     SwitchingMechanismParameters,
     SwitchingMapParameters,
     SwitchingMapResult,
+    TiltMapParameters,
+    TiltMapResult,
     InitialTransitionFeatureParameters,
     InitialTransitionFeatureResult,
     TransitionOutcomeParameters,
@@ -71,6 +76,7 @@ from .analysis import (
     export_state_classification,
     export_state_prediction,
     export_switching_map,
+    export_tilt_map,
     export_transition_outcome_maps,
     load_topography_image,
     load_state,
@@ -82,6 +88,7 @@ from .analysis import (
     run_state_classification,
     run_state_prediction,
     run_switching_map,
+    run_tilt_map,
     run_transition_outcome_maps,
     robust_normalize_map,
     total_and_ef_maps,
@@ -121,11 +128,13 @@ class AnalysisApp:
         "EDC/MDC Compare",
         "Feature Search",
         "Clustering",
+        "Tilt Map",
         "Switching Map",
         "State Prediction",
         "Transition Outcome Maps",
         "Initial State Transition Features",
         "Switching Mechanism Diagnostics",
+        "Irat Transition Maps",
     ]
     ANALYSIS_PANEL_MIN_FILES = {
         "Analysis": 1,
@@ -134,11 +143,13 @@ class AnalysisApp:
         "EDC/MDC Compare": 2,
         "Feature Search": 2,
         "Clustering": 1,
+        "Tilt Map": 1,
         "Switching Map": 2,
         "State Prediction": 2,
         "Transition Outcome Maps": 2,
         "Initial State Transition Features": 2,
         "Switching Mechanism Diagnostics": 2,
+        "Irat Transition Maps": 2,
     }
     VIEW_OPTIONS = [
         "Average normalized total map",
@@ -226,6 +237,18 @@ class AnalysisApp:
         "Leading-edge closeness": "LE_closeness_norm",
         "Normalized linewidth": "Gamma_norm",
         "Orientation shift": "Orient_shift_norm",
+    }
+    TILT_MAP_OPTIONS = {
+        "Tilt phi offset": "tilt",
+        "Peak tilt phi": "peak_tilt",
+        "Tilt gradient": "gradient",
+        "Local tilt variance": "local_std",
+        "Defect score": "defect_score",
+        "Defect type": "defect_type",
+        "Tilt groups": "groups",
+        "Region mean tilt": "region_mean_tilt",
+        "Band weight": "band_weight",
+        "Phi width": "phi_width",
     }
     TRANSITION_OUTCOME_MAP_OPTIONS = {
         "Transition label": "transition_label",
@@ -342,6 +365,10 @@ class AnalysisApp:
         self.classifier_result: StateClassificationResult | None = None
         self.classifier_selected_pixel: tuple[int, int] | None = None
         self.classifier_map_axes: list[matplotlib.axes.Axes] = []
+        self.tilt_file_path: str | None = None
+        self.tilt_result: TiltMapResult | None = None
+        self.tilt_selected_pixel: tuple[int, int] | None = None
+        self.tilt_map_axes: list[matplotlib.axes.Axes] = []
 
         self.switching_file_paths: list[str] = []
         self.switching_result: SwitchingMapResult | None = None
@@ -368,12 +395,18 @@ class AnalysisApp:
         self.initial_transition_result: InitialTransitionFeatureResult | None = None
         self.initial_transition_selected_pixel: tuple[int, int] | None = None
         self.initial_transition_map_axes: list[matplotlib.axes.Axes] = []
+        self.irat_transition_file_paths: list[str] = []
+        self.irat_transition_excluded_indices: set[int] = set()
+        self.irat_transition_result: InitialTransitionFeatureResult | None = None
+        self.irat_transition_selected_pixel: tuple[int, int] | None = None
+        self.irat_transition_map_axes: list[matplotlib.axes.Axes] = []
         self.mechanism_result: SwitchingMechanismDiagnosticsResult | None = None
         self.mechanism_selected_pixel: tuple[int, int] | None = None
         self.mechanism_map_axes: list[matplotlib.axes.Axes] = []
         self.mechanism_file_paths: list[str] = []
         self.mechanism_worker_thread: threading.Thread | None = None
         self.mechanism_worker_queue: queue.Queue[tuple[str, object]] | None = None
+        self.mechanism_worker_source: str = "files"
         self.topography_file_path: str | None = None
         self.topography_cache_path: str | None = None
         self.topography_cache_image: np.ndarray | None = None
@@ -503,6 +536,25 @@ class AnalysisApp:
             "low_signal_quantile": tk.StringVar(value=str(classifier_defaults.low_signal_quantile)),
             "lhb_min_quantile": tk.StringVar(value=str(classifier_defaults.lhb_min_quantile)),
         }
+        tilt_defaults = TiltMapParameters()
+        self.tilt_status_var = tk.StringVar(
+            value="Choose one data file, then compute local ARPES phi tilt and geometry defects."
+        )
+        self.tilt_file_var = tk.StringVar(value="")
+        self.tilt_map_var = tk.StringVar(value="Tilt phi offset")
+        self.tilt_parameter_vars = {
+            "band_min_ev": tk.StringVar(value=str(tilt_defaults.band_min_ev)),
+            "band_max_ev": tk.StringVar(value=str(tilt_defaults.band_max_ev)),
+            "phi_reference": tk.StringVar(value=str(tilt_defaults.phi_reference)),
+            "spatial_smooth_sigma": tk.StringVar(value=str(tilt_defaults.spatial_smooth_sigma)),
+            "defect_tilt_percentile": tk.StringVar(value=str(tilt_defaults.defect_tilt_percentile)),
+            "defect_gradient_percentile": tk.StringVar(value=str(tilt_defaults.defect_gradient_percentile)),
+            "low_signal_percentile": tk.StringVar(value=str(tilt_defaults.low_signal_percentile)),
+            "signal_floor_fraction": tk.StringVar(value=str(tilt_defaults.signal_floor_fraction)),
+            "local_window": tk.StringVar(value=str(tilt_defaults.local_window)),
+            "group_count": tk.StringVar(value=str(tilt_defaults.group_count)),
+            "min_group_size": tk.StringVar(value=str(tilt_defaults.min_group_size)),
+        }
         switching_defaults = SwitchingMapParameters()
         self.switching_status_var = tk.StringVar(
             value="Add chronological data files, tune EF/LHB windows, then compute switching sites."
@@ -570,7 +622,7 @@ class AnalysisApp:
         }
         initial_transition_defaults = InitialTransitionFeatureParameters()
         self.initial_transition_status_var = tk.StringVar(
-            value="Add a chronological transition sequence, choose a reference file, then compute initial-state transition features."
+            value="Add a chronological transition sequence, choose a reference file, then compute I_rat-based transition features."
         )
         self.initial_transition_reference_var = tk.StringVar(value="")
         self.initial_transition_mode_var = tk.StringVar(value="sequential")
@@ -582,6 +634,9 @@ class AnalysisApp:
             "fermi_level_ev": tk.StringVar(value=str(initial_transition_defaults.fermi_level_ev)),
             "ef_min_ev": tk.StringVar(value=str(initial_transition_defaults.ef_min_ev)),
             "ef_max_ev": tk.StringVar(value=str(initial_transition_defaults.ef_max_ev)),
+            "lhb_center_ev": tk.StringVar(value=str(initial_transition_defaults.lhb_center_ev)),
+            "lhb_halfwidth_ev": tk.StringVar(value=str(initial_transition_defaults.lhb_halfwidth_ev)),
+            "smooth_sigma": tk.StringVar(value=str(initial_transition_defaults.smooth_sigma)),
             "feature_min_ev": tk.StringVar(value=str(initial_transition_defaults.feature_min_ev)),
             "feature_max_ev": tk.StringVar(value=str(initial_transition_defaults.feature_max_ev)),
             "asymmetry_split_ev": tk.StringVar(value=str(initial_transition_defaults.asymmetry_split_ev)),
@@ -590,6 +645,19 @@ class AnalysisApp:
             "stable_percentile": tk.StringVar(value=str(initial_transition_defaults.stable_percentile)),
             "future_metallic_min_count": tk.StringVar(value="1"),
             "future_erased_min_count": tk.StringVar(value="1"),
+        }
+        self.irat_transition_status_var = tk.StringVar(
+            value="Add Max-style scan sequence files, then compute write/erase maps from Delta I_rat."
+        )
+        self.irat_transition_reference_var = tk.StringVar(value="")
+        self.irat_transition_mode_var = tk.StringVar(value="sequential")
+        self.irat_transition_normalization_var = tk.StringVar(value=initial_transition_defaults.normalization_mode)
+        self.irat_transition_allow_overlap_var = tk.BooleanVar(value=initial_transition_defaults.allow_overlap)
+        self.irat_transition_aggregate_map_var = tk.StringVar(value="Metallic count")
+        self.irat_transition_selected_transition_var = tk.StringVar(value="")
+        self.irat_transition_parameter_vars = {
+            key: tk.StringVar(value=var.get())
+            for key, var in self.initial_transition_parameter_vars.items()
         }
         mechanism_defaults = SwitchingMechanismParameters()
         self.mechanism_status_var = tk.StringVar(
@@ -626,10 +694,12 @@ class AnalysisApp:
                 self._set_curve_files(initial_files)
                 self._set_feature_files(initial_files)
                 self._set_classifier_file(initial_files[0])
+                self._set_tilt_file(initial_files[0])
                 self._set_switching_files(initial_files)
                 self._set_state_prediction_files(initial_files)
                 self._set_transition_outcome_files(initial_files)
                 self._set_initial_transition_files(initial_files)
+                self._set_irat_transition_files(initial_files)
                 self._set_mechanism_files(initial_files)
 
         self._render_placeholder_text()
@@ -638,10 +708,12 @@ class AnalysisApp:
         self._render_curve_placeholder()
         self._render_feature_placeholder()
         self._render_classifier_placeholder()
+        self._render_tilt_placeholder()
         self._render_switching_placeholder()
         self._render_state_prediction_placeholder()
         self._render_transition_outcome_placeholder()
         self._render_initial_transition_placeholder()
+        self._render_irat_transition_placeholder()
         self._render_mechanism_placeholder()
         self._render_notebook_placeholder()
 
@@ -686,6 +758,10 @@ class AnalysisApp:
         self.top_notebook.add(classifier_frame, text="Clustering")
         self._build_state_classifier_panel(classifier_frame)
 
+        tilt_frame = ttk.Frame(self.top_notebook)
+        self.top_notebook.add(tilt_frame, text="Tilt Map")
+        self._build_tilt_map_panel(tilt_frame)
+
         switching_frame = ttk.Frame(self.top_notebook)
         self.top_notebook.add(switching_frame, text="Switching Map")
         self._build_switching_panel(switching_frame)
@@ -705,6 +781,10 @@ class AnalysisApp:
         mechanism_frame = ttk.Frame(self.top_notebook)
         self.top_notebook.add(mechanism_frame, text="Switching Mechanism Diagnostics")
         self._build_switching_mechanism_panel(mechanism_frame)
+
+        irat_transition_frame = ttk.Frame(self.top_notebook)
+        self.top_notebook.add(irat_transition_frame, text="Irat Transition Maps")
+        self._build_irat_transition_panel(irat_transition_frame)
 
         jupyter_frame = ttk.Frame(self.top_notebook)
         self.top_notebook.add(jupyter_frame, text="Jupyter notebooks")
@@ -988,10 +1068,12 @@ class AnalysisApp:
         self._set_curve_files(paths)
         self._set_feature_files(paths)
         self._set_classifier_file(paths[0] if paths else None)
+        self._set_tilt_file(paths[0] if paths else None)
         self._set_switching_files(paths)
         self._set_state_prediction_files(paths)
         self._set_transition_outcome_files(paths)
         self._set_initial_transition_files(paths)
+        self._set_irat_transition_files(paths)
         self._set_mechanism_files(paths)
 
     def _show_runner_gate(self) -> None:
@@ -1096,11 +1178,13 @@ class AnalysisApp:
             "EDC/MDC Compare": self._run_curve_comparison,
             "Feature Search": self._run_feature_search,
             "Clustering": self._run_state_classifier,
+            "Tilt Map": self._run_tilt_map,
             "Switching Map": self._run_switching_map,
             "State Prediction": self._run_state_prediction,
             "Transition Outcome Maps": self._run_transition_outcome_maps,
             "Initial State Transition Features": self._run_initial_transition_analysis,
             "Switching Mechanism Diagnostics": lambda: self._run_mechanism_diagnostics(source="files"),
+            "Irat Transition Maps": self._run_irat_transition_analysis,
         }
         run_action = run_map.get(panel_name)
         if run_action is None:
@@ -1138,6 +1222,8 @@ class AnalysisApp:
             return self.feature_score_map is not None
         if panel_name == "Clustering":
             return self.classifier_result is not None
+        if panel_name == "Tilt Map":
+            return self.tilt_result is not None
         if panel_name == "Switching Map":
             return self.switching_result is not None
         if panel_name == "State Prediction":
@@ -1148,6 +1234,8 @@ class AnalysisApp:
             return self.initial_transition_result is not None
         if panel_name == "Switching Mechanism Diagnostics":
             return self.mechanism_result is not None
+        if panel_name == "Irat Transition Maps":
+            return self.irat_transition_result is not None
         return False
 
     def _mark_runner_complete(self, panel_name: str) -> None:
@@ -1328,6 +1416,19 @@ class AnalysisApp:
         self._build_state_classifier_controls_panel(controls_frame)
         self._build_state_classifier_visual_panel(right_frame)
 
+    def _build_tilt_map_panel(self, parent: ttk.Frame) -> None:
+        main_pane = ttk.Panedwindow(parent, orient=tk.HORIZONTAL)
+        main_pane.pack(fill=tk.BOTH, expand=True)
+
+        controls_frame = ttk.Frame(main_pane, padding=12)
+        main_pane.add(controls_frame, weight=0)
+
+        right_frame = ttk.Frame(main_pane, padding=(0, 12, 12, 12))
+        main_pane.add(right_frame, weight=1)
+
+        self._build_tilt_map_controls_panel(controls_frame)
+        self._build_tilt_map_visual_panel(right_frame)
+
     def _build_switching_panel(self, parent: ttk.Frame) -> None:
         main_pane = ttk.Panedwindow(parent, orient=tk.HORIZONTAL)
         main_pane.pack(fill=tk.BOTH, expand=True)
@@ -1379,6 +1480,19 @@ class AnalysisApp:
 
         self._build_initial_transition_controls_panel(controls_frame)
         self._build_initial_transition_visual_panel(right_frame)
+
+    def _build_irat_transition_panel(self, parent: ttk.Frame) -> None:
+        main_pane = ttk.Panedwindow(parent, orient=tk.HORIZONTAL)
+        main_pane.pack(fill=tk.BOTH, expand=True)
+
+        controls_frame = ttk.Frame(main_pane, padding=12)
+        main_pane.add(controls_frame, weight=0)
+
+        right_frame = ttk.Frame(main_pane, padding=(0, 12, 12, 12))
+        main_pane.add(right_frame, weight=1)
+
+        self._build_irat_transition_controls_panel(controls_frame)
+        self._build_irat_transition_visual_panel(right_frame)
 
     def _build_switching_mechanism_panel(self, parent: ttk.Frame) -> None:
         main_pane = ttk.Panedwindow(parent, orient=tk.HORIZONTAL)
@@ -2147,6 +2261,145 @@ class AnalysisApp:
             padx=(10, 0),
             pady=2,
         )
+
+    def _build_tilt_map_controls_panel(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+        canvas = tk.Canvas(parent, highlightthickness=0, width=390)
+        scrollbar = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        content = ttk.Frame(canvas)
+        content.columnconfigure(0, weight=1)
+        window = canvas.create_window((0, 0), window=content, anchor="nw")
+        content.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, width=max(1, int(event.width))))
+
+        file_frame = ttk.LabelFrame(content, text="Input File", padding=10)
+        file_frame.grid(row=0, column=0, sticky="ew")
+        file_frame.columnconfigure(0, weight=1)
+        ttk.Entry(file_frame, textvariable=self.tilt_file_var, state="readonly", width=34).grid(
+            row=0,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+        )
+        ttk.Button(file_frame, text="Choose File", command=self._choose_tilt_file).grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(file_frame, text="Use Analysis File", command=self._use_analysis_file_for_tilt).grid(
+            row=1,
+            column=1,
+            sticky="ew",
+            padx=(8, 0),
+            pady=(8, 0),
+        )
+
+        display_frame = ttk.LabelFrame(content, text="Display", padding=10)
+        display_frame.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        display_frame.columnconfigure(0, weight=1)
+        ttk.Label(display_frame, text="Map").grid(row=0, column=0, sticky="w")
+        self.tilt_map_combo = ttk.Combobox(
+            display_frame,
+            textvariable=self.tilt_map_var,
+            values=list(self.TILT_MAP_OPTIONS.keys()),
+            state="readonly",
+            width=34,
+        )
+        self.tilt_map_combo.grid(row=1, column=0, sticky="ew")
+        self.tilt_map_combo.bind("<<ComboboxSelected>>", lambda _event: self._refresh_tilt_views())
+
+        band_frame = ttk.LabelFrame(content, text="Band and Tilt Controls", padding=10)
+        band_frame.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        band_frame.columnconfigure(1, weight=1)
+        for row, (label, key) in enumerate(
+            [
+                ("Band min eV", "band_min_ev"),
+                ("Band max eV", "band_max_ev"),
+                ("Reference phi", "phi_reference"),
+                ("Spatial smooth sigma", "spatial_smooth_sigma"),
+                ("Low signal percentile", "low_signal_percentile"),
+                ("Signal floor fraction", "signal_floor_fraction"),
+            ]
+        ):
+            self._add_tilt_parameter_row(band_frame, row, label, key)
+
+        defect_frame = ttk.LabelFrame(content, text="Defect and Grouping", padding=10)
+        defect_frame.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        defect_frame.columnconfigure(1, weight=1)
+        for row, (label, key) in enumerate(
+            [
+                ("High tilt percentile", "defect_tilt_percentile"),
+                ("Gradient percentile", "defect_gradient_percentile"),
+                ("Local window px", "local_window"),
+                ("Tilt group count", "group_count"),
+                ("Min group size px", "min_group_size"),
+            ]
+        ):
+            self._add_tilt_parameter_row(defect_frame, row, label, key)
+
+        actions_frame = ttk.LabelFrame(content, text="Actions", padding=10)
+        actions_frame.grid(row=4, column=0, sticky="ew", pady=(12, 0))
+        actions_frame.columnconfigure(0, weight=1)
+        ttk.Button(actions_frame, text="Compute Tilt Map", command=self._run_tilt_map).grid(row=0, column=0, sticky="ew")
+        ttk.Button(actions_frame, text="Export Results...", command=self._save_tilt_results).grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(actions_frame, text="Save Plot...", command=self._save_tilt_plot).grid(row=2, column=0, sticky="ew", pady=(8, 0))
+
+    def _add_tilt_parameter_row(self, parent: ttk.LabelFrame, row: int, label: str, key: str) -> None:
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w")
+        ttk.Entry(parent, textvariable=self.tilt_parameter_vars[key], width=14).grid(
+            row=row,
+            column=1,
+            sticky="e",
+            padx=(10, 0),
+            pady=2,
+        )
+
+    def _build_tilt_map_visual_panel(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+        ttk.Label(
+            parent,
+            textvariable=self.tilt_status_var,
+            anchor="w",
+            justify=tk.LEFT,
+            wraplength=1120,
+        ).grid(row=0, column=0, sticky="ew", pady=(0, 8))
+
+        notebook = ttk.Notebook(parent)
+        notebook.grid(row=1, column=0, sticky="nsew")
+
+        maps_frame = ttk.Frame(notebook, padding=8)
+        maps_frame.columnconfigure(0, weight=1)
+        maps_frame.rowconfigure(0, weight=1)
+        notebook.add(maps_frame, text="Tilt Maps")
+        self.tilt_figure = Figure(figsize=(12, 8), dpi=100, constrained_layout=True)
+        self.tilt_canvas = FigureCanvasTkAgg(self.tilt_figure, master=maps_frame)
+        self.tilt_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self.tilt_canvas.mpl_connect("button_press_event", self._on_tilt_plot_click)
+
+        local_frame = ttk.Frame(notebook, padding=8)
+        local_frame.columnconfigure(0, weight=1)
+        local_frame.rowconfigure(0, weight=1)
+        local_frame.rowconfigure(1, weight=0)
+        notebook.add(local_frame, text="Local ARPES")
+        self.tilt_local_figure = Figure(figsize=(12, 6), dpi=100, constrained_layout=True)
+        self.tilt_local_canvas = FigureCanvasTkAgg(self.tilt_local_figure, master=local_frame)
+        self.tilt_local_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self.tilt_summary_text = tk.Text(local_frame, height=8, wrap="word")
+        self.tilt_summary_text.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        self.tilt_summary_text.configure(state="disabled")
+
+        groups_frame = ttk.Frame(notebook, padding=8)
+        groups_frame.columnconfigure(0, weight=1)
+        groups_frame.rowconfigure(0, weight=1)
+        groups_frame.rowconfigure(1, weight=0)
+        notebook.add(groups_frame, text="Geometry Groups")
+        self.tilt_groups_figure = Figure(figsize=(12, 5), dpi=100, constrained_layout=True)
+        self.tilt_groups_canvas = FigureCanvasTkAgg(self.tilt_groups_figure, master=groups_frame)
+        self.tilt_groups_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self.tilt_groups_text = tk.Text(groups_frame, height=10, wrap="word")
+        self.tilt_groups_text.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        self.tilt_groups_text.configure(state="disabled")
 
     def _build_switching_controls_panel(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -2981,6 +3234,9 @@ class AnalysisApp:
                 ("Fermi level (eV)", "fermi_level_ev"),
                 ("EF min rel. (eV)", "ef_min_ev"),
                 ("EF max rel. (eV)", "ef_max_ev"),
+                ("LHB / p1 center (eV)", "lhb_center_ev"),
+                ("LHB / p1 halfwidth (eV)", "lhb_halfwidth_ev"),
+                ("EDC smooth sigma", "smooth_sigma"),
                 ("Feature min (eV)", "feature_min_ev"),
                 ("Feature max (eV)", "feature_max_ev"),
                 ("Asymmetry split (eV)", "asymmetry_split_ev"),
@@ -3029,6 +3285,207 @@ class AnalysisApp:
             padx=(10, 0),
             pady=2,
         )
+
+    def _build_irat_transition_controls_panel(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+        canvas = tk.Canvas(parent, highlightthickness=0, width=390)
+        scrollbar = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        content = ttk.Frame(canvas)
+        content.columnconfigure(0, weight=1)
+        window = canvas.create_window((0, 0), window=content, anchor="nw")
+        content.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, width=max(1, int(event.width))))
+
+        files_frame = ttk.LabelFrame(content, text="Max Scan Sequence", padding=10)
+        files_frame.grid(row=0, column=0, sticky="nsew")
+        files_frame.columnconfigure(0, weight=1)
+        self.irat_transition_file_tree = ttk.Treeview(
+            files_frame,
+            columns=("index", "filename", "role", "included", "notes"),
+            show="headings",
+            height=8,
+        )
+        for column, width in {
+            "index": 46,
+            "filename": 170,
+            "role": 112,
+            "included": 72,
+            "notes": 120,
+        }.items():
+            self.irat_transition_file_tree.heading(column, text=column)
+            self.irat_transition_file_tree.column(column, width=width, stretch=(column == "filename"))
+        self.irat_transition_file_tree.grid(row=0, column=0, columnspan=2, sticky="nsew")
+        ttk.Button(files_frame, text="Add Files", command=self._add_irat_transition_files).grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(files_frame, text="Use Analysis Files", command=self._copy_analysis_files_to_irat_transition_panel).grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
+        ttk.Button(files_frame, text="Remove Selected", command=self._remove_selected_irat_transition_files).grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(files_frame, text="Clear Files", command=self._clear_irat_transition_files).grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
+        ttk.Button(files_frame, text="Move Up", command=lambda: self._move_selected_irat_transition_file(-1)).grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(files_frame, text="Move Down", command=lambda: self._move_selected_irat_transition_file(1)).grid(row=3, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
+        ttk.Button(files_frame, text="Set Selected as Reference", command=self._set_selected_irat_transition_reference).grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(files_frame, text="Toggle Include", command=self._toggle_selected_irat_transition_file).grid(row=4, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
+
+        setup_frame = ttk.LabelFrame(content, text="Transition Setup", padding=10)
+        setup_frame.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        setup_frame.columnconfigure(1, weight=1)
+        ttk.Label(setup_frame, text="Reference").grid(row=0, column=0, sticky="w")
+        self.irat_transition_reference_combo = ttk.Combobox(
+            setup_frame,
+            textvariable=self.irat_transition_reference_var,
+            values=[],
+            state="readonly",
+            width=24,
+        )
+        self.irat_transition_reference_combo.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        self.irat_transition_reference_combo.bind("<<ComboboxSelected>>", lambda _event: self._sync_irat_transition_file_tree())
+        ttk.Label(setup_frame, text="Mode").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Combobox(
+            setup_frame,
+            textvariable=self.irat_transition_mode_var,
+            values=["sequential", "initial_reference"],
+            state="readonly",
+        ).grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(6, 0))
+        ttk.Label(setup_frame, text="Normalization").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Combobox(
+            setup_frame,
+            textvariable=self.irat_transition_normalization_var,
+            values=list(INITIAL_TRANSITION_NORMALIZATION_MODES),
+            state="readonly",
+        ).grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=(6, 0))
+        ttk.Checkbutton(
+            setup_frame,
+            text="Allow overlapping classes",
+            variable=self.irat_transition_allow_overlap_var,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        windows_frame = ttk.LabelFrame(content, text="I_rat Windows and Thresholds", padding=10)
+        windows_frame.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        windows_frame.columnconfigure(1, weight=1)
+        for row, (label, key) in enumerate(
+            [
+                ("Fermi level (eV)", "fermi_level_ev"),
+                ("EF min rel. (eV)", "ef_min_ev"),
+                ("EF max rel. (eV)", "ef_max_ev"),
+                ("LHB / p1 center (eV)", "lhb_center_ev"),
+                ("LHB / p1 halfwidth (eV)", "lhb_halfwidth_ev"),
+                ("EDC smooth sigma", "smooth_sigma"),
+                ("Feature min (eV)", "feature_min_ev"),
+                ("Feature max (eV)", "feature_max_ev"),
+                ("Asymmetry split (eV)", "asymmetry_split_ev"),
+                ("Written percentile", "metallic_percentile"),
+                ("Erased percentile", "erasure_percentile"),
+                ("Stable percentile", "stable_percentile"),
+                ("Future written min count", "future_metallic_min_count"),
+                ("Future erased min count", "future_erased_min_count"),
+            ]
+        ):
+            self._add_irat_transition_parameter_row(windows_frame, row, label, key)
+
+        display_frame = ttk.LabelFrame(content, text="Display", padding=10)
+        display_frame.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        display_frame.columnconfigure(1, weight=1)
+        ttk.Label(display_frame, text="Aggregate map").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(
+            display_frame,
+            textvariable=self.irat_transition_aggregate_map_var,
+            values=list(self.INITIAL_TRANSITION_AGGREGATE_MAP_OPTIONS.keys()),
+            state="readonly",
+        ).grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        ttk.Button(display_frame, text="Refresh Display", command=self._refresh_irat_transition_views).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(display_frame, text="Selected transition").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.irat_transition_selected_transition_combo = ttk.Combobox(
+            display_frame,
+            textvariable=self.irat_transition_selected_transition_var,
+            values=[],
+            state="readonly",
+        )
+        self.irat_transition_selected_transition_combo.grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
+        self.irat_transition_selected_transition_combo.bind("<<ComboboxSelected>>", lambda _event: self._refresh_irat_transition_views())
+
+        actions_frame = ttk.LabelFrame(content, text="Actions", padding=10)
+        actions_frame.grid(row=4, column=0, sticky="ew", pady=(12, 0))
+        actions_frame.columnconfigure(0, weight=1)
+        ttk.Button(actions_frame, text="Compute Irat Transition Maps", command=self._run_irat_transition_analysis).grid(row=0, column=0, sticky="ew")
+        ttk.Button(actions_frame, text="Export Results...", command=self._save_irat_transition_results).grid(row=1, column=0, sticky="ew", pady=(8, 0))
+
+        ttk.Label(
+            content,
+            text=(
+                "Uses Max's I_rat = W_EF / W_LHB. Written maps are positive Delta I_rat; "
+                "erased maps are negative Delta I_rat from the same transition."
+            ),
+            justify=tk.LEFT,
+            wraplength=330,
+        ).grid(row=5, column=0, sticky="ew", pady=(12, 0))
+
+    def _add_irat_transition_parameter_row(self, parent: ttk.LabelFrame, row: int, label: str, key: str) -> None:
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w")
+        ttk.Entry(parent, textvariable=self.irat_transition_parameter_vars[key], width=14).grid(
+            row=row,
+            column=1,
+            sticky="e",
+            padx=(10, 0),
+            pady=2,
+        )
+
+    def _build_irat_transition_visual_panel(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+        ttk.Label(
+            parent,
+            textvariable=self.irat_transition_status_var,
+            anchor="w",
+            justify=tk.LEFT,
+            wraplength=1120,
+        ).grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        notebook = ttk.Notebook(parent)
+        notebook.grid(row=1, column=0, sticky="nsew")
+
+        aggregate_frame = ttk.Frame(notebook, padding=8)
+        aggregate_frame.columnconfigure(0, weight=1)
+        aggregate_frame.rowconfigure(0, weight=1)
+        notebook.add(aggregate_frame, text="Aggregate Maps")
+        self.irat_transition_aggregate_figure = Figure(figsize=(12, 8), dpi=100, constrained_layout=True)
+        self.irat_transition_aggregate_canvas = FigureCanvasTkAgg(self.irat_transition_aggregate_figure, master=aggregate_frame)
+        self.irat_transition_aggregate_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self.irat_transition_aggregate_canvas.mpl_connect("button_press_event", self._on_irat_transition_plot_click)
+
+        precursor_frame = ttk.Frame(notebook, padding=8)
+        precursor_frame.columnconfigure(0, weight=1)
+        precursor_frame.rowconfigure(0, weight=1)
+        notebook.add(precursor_frame, text="Initial Irat Precursors")
+        self.irat_transition_precursor_figure = Figure(figsize=(12, 4.8), dpi=100, constrained_layout=True)
+        self.irat_transition_precursor_canvas = FigureCanvasTkAgg(self.irat_transition_precursor_figure, master=precursor_frame)
+        self.irat_transition_precursor_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self.irat_transition_precursor_canvas.mpl_connect("button_press_event", self._on_irat_transition_plot_click)
+
+        diagnostics_frame = ttk.Frame(notebook, padding=8)
+        diagnostics_frame.columnconfigure(0, weight=1)
+        diagnostics_frame.rowconfigure(0, weight=1)
+        diagnostics_frame.rowconfigure(1, weight=0)
+        notebook.add(diagnostics_frame, text="Pixel Diagnostics")
+        self.irat_transition_diagnostics_figure = Figure(figsize=(12, 8), dpi=100, constrained_layout=True)
+        self.irat_transition_diagnostics_canvas = FigureCanvasTkAgg(self.irat_transition_diagnostics_figure, master=diagnostics_frame)
+        self.irat_transition_diagnostics_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self.irat_transition_diagnostics_canvas.mpl_connect("button_press_event", self._on_irat_transition_plot_click)
+        self.irat_transition_timeline_text = tk.Text(diagnostics_frame, height=7, wrap="word")
+        self.irat_transition_timeline_text.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        self.irat_transition_timeline_text.configure(state="disabled")
+
+        stats_frame = ttk.Frame(notebook, padding=8)
+        stats_frame.columnconfigure(0, weight=1)
+        stats_frame.rowconfigure(0, weight=1)
+        stats_frame.rowconfigure(1, weight=0)
+        notebook.add(stats_frame, text="Population Spectra")
+        self.irat_transition_stats_figure = Figure(figsize=(12, 4.8), dpi=100, constrained_layout=True)
+        self.irat_transition_stats_canvas = FigureCanvasTkAgg(self.irat_transition_stats_figure, master=stats_frame)
+        self.irat_transition_stats_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self.irat_transition_stats_text = tk.Text(stats_frame, height=7, wrap="word")
+        self.irat_transition_stats_text.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        self.irat_transition_stats_text.configure(state="disabled")
 
     def _build_initial_transition_visual_panel(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -3107,10 +3564,11 @@ class AnalysisApp:
         ttk.Button(source_frame, text="Add Files", command=self._add_mechanism_files).grid(row=1, column=0, sticky="ew", pady=(8, 0))
         ttk.Button(source_frame, text="Use Analysis Files", command=self._copy_analysis_files_to_mechanism).grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
         ttk.Button(source_frame, text="Use Initial-State Files", command=self._copy_initial_transition_files_to_mechanism).grid(row=2, column=0, sticky="ew", pady=(8, 0))
-        ttk.Button(source_frame, text="Remove Selected", command=self._remove_selected_mechanism_file).grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
-        ttk.Button(source_frame, text="Move Up", command=lambda: self._move_selected_mechanism_file(-1)).grid(row=3, column=0, sticky="ew", pady=(8, 0))
-        ttk.Button(source_frame, text="Move Down", command=lambda: self._move_selected_mechanism_file(1)).grid(row=3, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
-        ttk.Button(source_frame, text="Clear Files", command=self._clear_mechanism_files).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(source_frame, text="Use Irat Map Files", command=self._copy_irat_transition_files_to_mechanism).grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
+        ttk.Button(source_frame, text="Remove Selected", command=self._remove_selected_mechanism_file).grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(source_frame, text="Move Up", command=lambda: self._move_selected_mechanism_file(-1)).grid(row=3, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
+        ttk.Button(source_frame, text="Move Down", command=lambda: self._move_selected_mechanism_file(1)).grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(source_frame, text="Clear Files", command=self._clear_mechanism_files).grid(row=4, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
         self.mechanism_compute_button = ttk.Button(
             source_frame,
             text="Compute Diagnostics",
@@ -3123,10 +3581,16 @@ class AnalysisApp:
             command=lambda: self._run_mechanism_diagnostics(source="initial"),
         )
         self.mechanism_initial_compute_button.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.mechanism_irat_compute_button = ttk.Button(
+            source_frame,
+            text="Compute From Irat Transition Maps",
+            command=lambda: self._run_mechanism_diagnostics(source="irat"),
+        )
+        self.mechanism_irat_compute_button.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         self.mechanism_export_button = ttk.Button(source_frame, text="Export Diagnostics...", command=self._save_mechanism_results)
-        self.mechanism_export_button.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.mechanism_export_button.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         self.mechanism_progress = ttk.Progressbar(source_frame, mode="indeterminate")
-        self.mechanism_progress.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.mechanism_progress.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(10, 0))
 
         groups_frame = ttk.LabelFrame(content, text="Group Filters", padding=10)
         groups_frame.grid(row=1, column=0, sticky="ew", pady=(12, 0))
@@ -3184,9 +3648,9 @@ class AnalysisApp:
         self.mechanism_selected_transition_combo.bind("<<ComboboxSelected>>", lambda _event: self._refresh_mechanism_views())
 
         note = (
-            "The diagnostics use the same thresholds, transition mode, EF window, feature window, "
-            "and normalization from Initial State Transition Features. You can compute directly from files here, "
-            "or reuse an already-computed Initial State Transition Features result."
+            "The diagnostics use I_rat-based write/erase thresholds: written is positive Delta I_rat, "
+            "erased is negative Delta I_rat. You can compute directly from files here, reuse Initial-State results, "
+            "or reuse an already-computed Irat Transition Maps result."
         )
         ttk.Label(content, text=note, wraplength=360, justify=tk.LEFT).grid(row=5, column=0, sticky="ew", pady=(14, 0))
 
@@ -7345,6 +7809,411 @@ class AnalysisApp:
             return
         self.classifier_status_var.set(f"Saved clustering plot to {path}")
 
+    def _set_tilt_file(self, file_path: str | None) -> None:
+        self.tilt_file_path = str(Path(file_path).expanduser().resolve()) if file_path else None
+        self.tilt_file_var.set(self.tilt_file_path or "")
+        self.tilt_result = None
+        self.tilt_selected_pixel = None
+        self.tilt_map_axes = []
+        self._render_tilt_placeholder()
+
+    def _choose_tilt_file(self) -> None:
+        selected = filedialog.askopenfilename(title="Choose ARPES data file", filetypes=FILE_TYPES)
+        if not selected:
+            return
+        self._set_tilt_file(selected)
+
+    def _use_analysis_file_for_tilt(self) -> None:
+        if not self.file_paths:
+            messagebox.showinfo("No analysis files", "Add a file in the Analysis panel first, or choose a tilt-map file directly.")
+            return
+        self._set_tilt_file(self.file_paths[0])
+
+    def _parse_tilt_parameters(self) -> TiltMapParameters:
+        try:
+            params = TiltMapParameters(
+                band_min_ev=float(self.tilt_parameter_vars["band_min_ev"].get()),
+                band_max_ev=float(self.tilt_parameter_vars["band_max_ev"].get()),
+                phi_reference=float(self.tilt_parameter_vars["phi_reference"].get()),
+                spatial_smooth_sigma=float(self.tilt_parameter_vars["spatial_smooth_sigma"].get()),
+                defect_tilt_percentile=float(self.tilt_parameter_vars["defect_tilt_percentile"].get()),
+                defect_gradient_percentile=float(self.tilt_parameter_vars["defect_gradient_percentile"].get()),
+                low_signal_percentile=float(self.tilt_parameter_vars["low_signal_percentile"].get()),
+                signal_floor_fraction=float(self.tilt_parameter_vars["signal_floor_fraction"].get()),
+                local_window=max(1, int(float(self.tilt_parameter_vars["local_window"].get()))),
+                group_count=max(2, int(float(self.tilt_parameter_vars["group_count"].get()))),
+                min_group_size=max(0, int(float(self.tilt_parameter_vars["min_group_size"].get()))),
+            )
+        except ValueError as exc:
+            raise ValueError(f"Could not parse Tilt Map controls: {exc}") from exc
+        params.validate()
+        return params
+
+    def _run_tilt_map(self) -> None:
+        if self.tilt_file_path is None:
+            messagebox.showerror("Missing file", "Please choose one data file for Tilt Map.")
+            return
+        try:
+            params = self._parse_tilt_parameters()
+        except Exception as exc:
+            messagebox.showerror("Invalid parameters", str(exc))
+            return
+
+        self.tilt_status_var.set("Computing local ARPES phi tilt, defect masks, and geometry groups...")
+        self._start_global_progress("Tilt Map running...")
+        self.root.update_idletasks()
+        try:
+            self.tilt_result = run_tilt_map(self.tilt_file_path, params)
+            self.tilt_selected_pixel = self._default_tilt_pixel()
+        except Exception as exc:
+            self.tilt_result = None
+            self.tilt_selected_pixel = None
+            self.tilt_status_var.set("Tilt Map failed.")
+            self._finish_global_progress("Tilt Map failed.", success=False)
+            messagebox.showerror("Tilt Map failed", str(exc))
+            self._render_tilt_placeholder()
+            return
+
+        self._refresh_tilt_views()
+        result = self.tilt_result
+        self.tilt_status_var.set(
+            f"Computed tilt map for {Path(result.file_path).name}: {result.shape[0]} x {result.shape[1]} pixels, "
+            f"{int(np.count_nonzero(result.defect_mask))} geometry-defect pixels."
+        )
+        self._finish_global_progress("Tilt Map complete.")
+
+    def _default_tilt_pixel(self) -> tuple[int, int]:
+        if self.tilt_result is None:
+            return (0, 0)
+        score = np.asarray(self.tilt_result.defect_score_map, dtype=np.float32)
+        if np.any(np.isfinite(score)):
+            return divmod(int(np.nanargmax(score)), score.shape[1])
+        valid = np.asarray(self.tilt_result.valid_mask, dtype=bool)
+        if np.any(valid):
+            return tuple(int(value) for value in np.argwhere(valid)[0])
+        return (0, 0)
+
+    def _render_tilt_placeholder(self) -> None:
+        for attr, message in [
+            ("tilt_figure", "Choose one ARPES file, then compute local tilt and geometry defects."),
+            ("tilt_local_figure", "Click a tilt-map pixel to inspect its local ARPES band structure."),
+            ("tilt_groups_figure", "Tilt-domain grouping and defect summaries will appear here."),
+        ]:
+            if not hasattr(self, attr):
+                continue
+            figure = getattr(self, attr)
+            figure.clear()
+            axis = figure.add_subplot(111)
+            axis.text(0.5, 0.5, message, ha="center", va="center", fontsize=12)
+            axis.set_axis_off()
+
+        if hasattr(self, "tilt_canvas"):
+            self.tilt_canvas.draw_idle()
+            self.tilt_local_canvas.draw_idle()
+            self.tilt_groups_canvas.draw_idle()
+        if hasattr(self, "tilt_summary_text"):
+            self._set_text_widget(self.tilt_summary_text, "")
+        if hasattr(self, "tilt_groups_text"):
+            self._set_text_widget(self.tilt_groups_text, "")
+
+    def _refresh_tilt_views(self) -> None:
+        if self.tilt_result is None:
+            self._render_tilt_placeholder()
+            return
+        if self.tilt_selected_pixel is None:
+            self.tilt_selected_pixel = self._default_tilt_pixel()
+        self._refresh_tilt_map_plot()
+        self._refresh_tilt_local_plot()
+        self._refresh_tilt_groups_plot()
+
+    def _tilt_display_map(self, key: str) -> np.ndarray:
+        assert self.tilt_result is not None
+        result = self.tilt_result
+        if key == "tilt":
+            return result.tilt_map
+        if key == "peak_tilt":
+            return result.peak_tilt_map
+        if key == "gradient":
+            return result.tilt_gradient_map
+        if key == "local_std":
+            return result.local_tilt_std_map
+        if key == "defect_score":
+            return result.defect_score_map
+        if key == "defect_type":
+            return result.defect_type_map.astype(np.float32)
+        if key == "groups":
+            return result.group_label_map.astype(np.float32)
+        if key == "region_mean_tilt":
+            return result.group_mean_tilt_map
+        if key == "band_weight":
+            return result.band_weight_map
+        if key == "phi_width":
+            return result.phi_width_map
+        return result.tilt_map
+
+    def _tilt_map_key(self) -> str:
+        return self.TILT_MAP_OPTIONS.get(self.tilt_map_var.get(), "tilt")
+
+    def _tilt_map_limits(self, data: np.ndarray, symmetric: bool = False) -> tuple[float | None, float | None]:
+        finite = np.asarray(data, dtype=np.float32)
+        finite = finite[np.isfinite(finite)]
+        if finite.size == 0:
+            return None, None
+        if symmetric:
+            limit = float(np.nanpercentile(np.abs(finite), 98))
+            return (-limit, limit) if np.isfinite(limit) and limit > 0 else (None, None)
+        low = float(np.nanpercentile(finite, 2))
+        high = float(np.nanpercentile(finite, 98))
+        if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+            return None, None
+        return low, high
+
+    def _refresh_tilt_map_plot(self) -> None:
+        assert self.tilt_result is not None
+        result = self.tilt_result
+        map_key = self._tilt_map_key()
+        selected_map = self._tilt_display_map(map_key)
+        self.tilt_figure.clear()
+        axes = self.tilt_figure.subplots(2, 3, squeeze=False)
+        self.tilt_map_axes = []
+        map_specs = [
+            ("Tilt phi offset", result.tilt_map, "coolwarm", True),
+            ("Tilt gradient", result.tilt_gradient_map, "magma", False),
+            ("Geometry defects", result.defect_type_map.astype(np.float32), "defect", False),
+            ("Region mean tilt", result.group_mean_tilt_map, "coolwarm", True),
+            ("Band weight", result.band_weight_map, "viridis", False),
+            (self.tilt_map_var.get(), selected_map, "selected", map_key in {"tilt", "peak_tilt", "region_mean_tilt"}),
+        ]
+        for axis, (title, values, cmap_name, symmetric) in zip(axes.reshape(-1), map_specs):
+            if cmap_name == "defect":
+                colors = [TILT_DEFECT_COLORS[label] for label in TILT_DEFECT_LABELS]
+                cmap = mcolors.ListedColormap(colors)
+                norm = mcolors.BoundaryNorm(np.arange(-0.5, len(TILT_DEFECT_LABELS) + 0.5, 1), cmap.N)
+                image = axis.imshow(values.T, origin="lower", cmap=cmap, norm=norm, aspect="auto")
+                cbar = self.tilt_figure.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
+                cbar.set_ticks(np.arange(len(TILT_DEFECT_LABELS)))
+                cbar.ax.set_yticklabels(TILT_DEFECT_LABELS, fontsize=7)
+            else:
+                cmap = "coolwarm" if cmap_name == "selected" and symmetric else "viridis" if cmap_name == "selected" else cmap_name
+                vmin, vmax = self._tilt_map_limits(values, symmetric=symmetric)
+                image = axis.imshow(values.T, origin="lower", cmap=cmap, aspect="auto", vmin=vmin, vmax=vmax)
+                self.tilt_figure.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
+            axis.set_title(title)
+            axis.set_xlabel("x")
+            axis.set_ylabel("y")
+            if title == "Region mean tilt" or (map_key == "region_mean_tilt" and title == self.tilt_map_var.get()):
+                self._annotate_tilt_group_labels(axis)
+            self._mark_tilt_selected_pixel(axis)
+            self.tilt_map_axes.append(axis)
+        self.tilt_canvas.draw_idle()
+
+    def _tilt_spectrum_payload(self, x_index: int, y_index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        assert self.tilt_result is not None
+        state = self.tilt_result.state
+        x_safe = min(max(0, int(x_index)), int(state.data_array.sizes["x"]) - 1)
+        y_safe = min(max(0, int(y_index)), int(state.data_array.sizes["y"]) - 1)
+        energy_axis = np.asarray(state.data_array.coords["eV"].values, dtype=np.float32)
+        phi_axis = np.asarray(state.data_array.coords["phi"].values, dtype=np.float32)
+        energy_order = np.argsort(energy_axis)
+        phi_order = np.argsort(phi_axis)
+        spectrum = np.asarray(state.data_array.isel(x=x_safe, y=y_safe).fillna(0).values, dtype=np.float32)
+        return spectrum[energy_order][:, phi_order], energy_axis[energy_order], phi_axis[phi_order]
+
+    def _refresh_tilt_local_plot(self) -> None:
+        assert self.tilt_result is not None
+        result = self.tilt_result
+        x_index, y_index = self.tilt_selected_pixel or self._default_tilt_pixel()
+        spectrum, energy_axis, phi_axis = self._tilt_spectrum_payload(x_index, y_index)
+        params = result.parameters
+        band_mask = (energy_axis >= params.band_min_ev) & (energy_axis <= params.band_max_ev)
+        if np.any(band_mask):
+            if int(np.count_nonzero(band_mask)) > 1:
+                local_mdc = np.trapezoid(spectrum[band_mask, :], x=energy_axis[band_mask], axis=0)
+            else:
+                local_mdc = np.sum(spectrum[band_mask, :], axis=0)
+        else:
+            local_mdc = np.sum(spectrum, axis=0)
+        edc = np.trapezoid(spectrum, x=phi_axis, axis=1) if phi_axis.size > 1 else np.sum(spectrum, axis=1)
+
+        self.tilt_local_figure.clear()
+        spectrum_axis, mdc_axis, edc_axis = self.tilt_local_figure.subplots(1, 3)
+        spectrum_image = spectrum_axis.imshow(
+            spectrum,
+            origin="lower",
+            aspect="auto",
+            extent=[float(phi_axis[0]), float(phi_axis[-1]), float(energy_axis[0]), float(energy_axis[-1])],
+            cmap="viridis",
+        )
+        tilt_value = float(result.tilt_map[x_index, y_index])
+        spectrum_axis.axvline(params.phi_reference, color="white", linestyle="--", linewidth=0.9)
+        if np.isfinite(tilt_value):
+            spectrum_axis.axvline(params.phi_reference + tilt_value, color="#ffbf00", linewidth=1.2)
+        spectrum_axis.axhspan(params.band_min_ev, params.band_max_ev, color="white", alpha=0.12)
+        spectrum_axis.set_title(f"Local ARPES spectrum\nx={x_index}, y={y_index}")
+        spectrum_axis.set_xlabel("phi")
+        spectrum_axis.set_ylabel("eV")
+        self.tilt_local_figure.colorbar(spectrum_image, ax=spectrum_axis, fraction=0.046, pad=0.04)
+
+        mdc_axis.plot(phi_axis, local_mdc, color="#1f77b4")
+        mdc_axis.axvline(params.phi_reference, color="#555555", linestyle="--", linewidth=0.9, label="reference")
+        if np.isfinite(tilt_value):
+            mdc_axis.axvline(params.phi_reference + tilt_value, color="#d62728", linewidth=1.1, label="center")
+        mdc_axis.set_title("Band-window MDC")
+        mdc_axis.set_xlabel("phi")
+        mdc_axis.legend(fontsize=8)
+
+        edc_axis.plot(energy_axis, edc, color="#2ca02c")
+        edc_axis.axvspan(params.band_min_ev, params.band_max_ev, color="#9ecae1", alpha=0.25)
+        edc_axis.set_title("Angle-integrated EDC")
+        edc_axis.set_xlabel("eV")
+        self.tilt_local_canvas.draw_idle()
+        self._update_tilt_summary_text(x_index, y_index)
+
+    def _refresh_tilt_groups_plot(self) -> None:
+        assert self.tilt_result is not None
+        result = self.tilt_result
+        self.tilt_groups_figure.clear()
+        group_axis, histogram_axis = self.tilt_groups_figure.subplots(1, 2)
+        group_image = group_axis.imshow(result.group_label_map.T, origin="lower", cmap="tab20", aspect="auto")
+        group_axis.imshow(np.where(result.defect_mask, 1.0, np.nan).T, origin="lower", cmap="Reds", aspect="auto", alpha=0.55)
+        group_axis.set_title("Tilt domains with defect overlay")
+        group_axis.set_xlabel("x")
+        group_axis.set_ylabel("y")
+        self._annotate_tilt_group_labels(group_axis)
+        self.tilt_groups_figure.colorbar(group_image, ax=group_axis, fraction=0.046, pad=0.04)
+        finite_tilt = result.tilt_map[result.valid_mask & np.isfinite(result.tilt_map)]
+        if finite_tilt.size:
+            histogram_axis.hist(finite_tilt, bins=36, color="#4c78a8", alpha=0.82)
+            histogram_axis.axvline(0, color="#333333", linestyle="--", linewidth=0.9)
+        histogram_axis.set_title("Tilt distribution")
+        histogram_axis.set_xlabel("tilt phi")
+        histogram_axis.set_ylabel("pixel count")
+        self.tilt_groups_canvas.draw_idle()
+
+        lines = [
+            f"Valid pixels: {int(np.count_nonzero(result.valid_mask))}",
+            f"Defect pixels: {int(np.count_nonzero(result.defect_mask))}",
+            f"High-tilt threshold: {result.thresholds['high_abs_tilt']:.6g}",
+            f"Gradient threshold: {result.thresholds['high_tilt_gradient']:.6g}",
+            "",
+            "Largest geometry groups:",
+        ]
+        rows = sorted(result.group_rows, key=lambda row: int(row.get("pixel_count", 0)), reverse=True)
+        for row in rows[:18]:
+            lines.append(
+                f"{row['group_id']}: {row['group_type']} | pixels={row['pixel_count']}, "
+                f"mean tilt={row.get('mean_tilt_phi', float('nan')):.5g}, "
+                f"mean gradient={row.get('mean_tilt_gradient', float('nan')):.5g}"
+            )
+        self._set_text_widget(self.tilt_groups_text, "\n".join(lines))
+
+    def _update_tilt_summary_text(self, x_index: int, y_index: int) -> None:
+        assert self.tilt_result is not None
+        result = self.tilt_result
+        defect_code = int(result.defect_type_map[x_index, y_index])
+        defect_label = TILT_DEFECT_LABELS[defect_code] if 0 <= defect_code < len(TILT_DEFECT_LABELS) else "unknown"
+        lines = [
+            f"File: {Path(result.file_path).name}",
+            f"Selected pixel: x={x_index}, y={y_index}",
+            f"Tilt phi offset: {float(result.tilt_map[x_index, y_index]):.6g}",
+            f"Peak tilt phi: {float(result.peak_tilt_map[x_index, y_index]):.6g}",
+            f"Band weight: {float(result.band_weight_map[x_index, y_index]):.6g}",
+            f"Phi width: {float(result.phi_width_map[x_index, y_index]):.6g}",
+            f"Tilt gradient: {float(result.tilt_gradient_map[x_index, y_index]):.6g}",
+            f"Local tilt std: {float(result.local_tilt_std_map[x_index, y_index]):.6g}",
+            f"Defect: {defect_label}",
+            f"Tilt group id: {int(result.group_label_map[x_index, y_index])}",
+            f"Region mean tilt: {float(result.group_mean_tilt_map[x_index, y_index]):.6g}",
+        ]
+        if result.notes:
+            lines.extend(["", "Notes:"])
+            lines.extend(f"- {note}" for note in result.notes)
+        self._set_text_widget(self.tilt_summary_text, "\n".join(lines))
+
+    def _on_tilt_plot_click(self, event: matplotlib.backend_bases.MouseEvent) -> None:
+        if self.tilt_result is None or event.inaxes not in self.tilt_map_axes:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        x_index = int(round(event.xdata))
+        y_index = int(round(event.ydata))
+        x_size, y_size = self.tilt_result.shape
+        if 0 <= x_index < x_size and 0 <= y_index < y_size:
+            self.tilt_selected_pixel = (x_index, y_index)
+            self._refresh_tilt_views()
+
+    def _mark_tilt_selected_pixel(self, axis: matplotlib.axes.Axes) -> None:
+        if self.tilt_selected_pixel is None:
+            return
+        x_index, y_index = self.tilt_selected_pixel
+        axis.scatter([x_index], [y_index], s=92, facecolors="none", edgecolors="white", linewidths=1.8)
+        axis.scatter([x_index], [y_index], s=18, c="black")
+
+    def _annotate_tilt_group_labels(self, axis: matplotlib.axes.Axes) -> None:
+        if self.tilt_result is None:
+            return
+        result = self.tilt_result
+        positive_rows = [
+            row
+            for row in result.group_rows
+            if int(row.get("group_id", 0)) > 0 and int(row.get("pixel_count", 0)) >= max(1, result.parameters.min_group_size)
+        ]
+        positive_rows.sort(key=lambda row: int(row.get("pixel_count", 0)), reverse=True)
+        for row in positive_rows[:40]:
+            group_id = int(row["group_id"])
+            mask = result.group_label_map == group_id
+            if not np.any(mask):
+                continue
+            xs, ys = np.where(mask)
+            x_center = float(np.nanmean(xs))
+            y_center = float(np.nanmean(ys))
+            mean_tilt = float(row.get("mean_tilt_phi", float("nan")))
+            if not np.isfinite(mean_tilt):
+                continue
+            text = axis.text(
+                x_center,
+                y_center,
+                f"{mean_tilt:+.3f}",
+                ha="center",
+                va="center",
+                fontsize=8,
+                color="white",
+                fontweight="bold",
+            )
+            text.set_path_effects([path_effects.Stroke(linewidth=2.2, foreground="black"), path_effects.Normal()])
+
+    def _save_tilt_results(self) -> None:
+        if self.tilt_result is None:
+            messagebox.showinfo("No Tilt Map result", "Compute a Tilt Map before exporting.")
+            return
+        directory = filedialog.askdirectory(title="Choose output folder for Tilt Map results")
+        if not directory:
+            return
+        try:
+            paths = export_tilt_map(self.tilt_result, directory)
+        except Exception as exc:
+            messagebox.showerror("Export failed", str(exc))
+            return
+        self.tilt_status_var.set(f"Saved Tilt Map pixel table to {paths['pixel_table']}")
+
+    def _save_tilt_plot(self) -> None:
+        if self.tilt_result is None:
+            messagebox.showinfo("No Tilt Map plot", "Compute a Tilt Map before saving a plot.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save Tilt Map plot",
+            defaultextension=".png",
+            filetypes=[("PNG image", "*.png"), ("PDF document", "*.pdf"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            self.tilt_figure.savefig(path, dpi=220)
+        except Exception as exc:
+            messagebox.showerror("Save failed", str(exc))
+            return
+        self.tilt_status_var.set(f"Saved Tilt Map plot to {path}")
+
     def _add_switching_files(self) -> None:
         selected = list(filedialog.askopenfilenames(title="Choose data files", filetypes=FILE_TYPES))
         if not selected:
@@ -7359,7 +8228,7 @@ class AnalysisApp:
             messagebox.showinfo("No analysis files", "Add files to the Analysis panel first, or add files here directly.")
             return
         self._set_switching_files(self.file_paths)
-        self.top_notebook.select(6)
+        self.top_notebook.select(self.ANALYSIS_PANEL_OPTIONS.index("Switching Map"))
 
     def _remove_selected_switching_files(self) -> None:
         selection = list(self.switching_file_listbox.curselection())
@@ -7857,7 +8726,7 @@ class AnalysisApp:
             messagebox.showinfo("No analysis files", "Add files to the Analysis panel first, or add files here directly.")
             return
         self._set_state_prediction_files(self.file_paths)
-        self.top_notebook.select(7)
+        self.top_notebook.select(self.ANALYSIS_PANEL_OPTIONS.index("State Prediction"))
 
     def _remove_selected_state_prediction_files(self) -> None:
         selection = list(self.state_prediction_file_listbox.curselection())
@@ -8711,6 +9580,9 @@ class AnalysisApp:
                 fermi_level_ev=float(self.initial_transition_parameter_vars["fermi_level_ev"].get()),
                 ef_min_ev=float(self.initial_transition_parameter_vars["ef_min_ev"].get()),
                 ef_max_ev=float(self.initial_transition_parameter_vars["ef_max_ev"].get()),
+                lhb_center_ev=float(self.initial_transition_parameter_vars["lhb_center_ev"].get()),
+                lhb_halfwidth_ev=float(self.initial_transition_parameter_vars["lhb_halfwidth_ev"].get()),
+                smooth_sigma=float(self.initial_transition_parameter_vars["smooth_sigma"].get()),
                 feature_min_ev=float(self.initial_transition_parameter_vars["feature_min_ev"].get()),
                 feature_max_ev=float(self.initial_transition_parameter_vars["feature_max_ev"].get()),
                 asymmetry_split_ev=float(self.initial_transition_parameter_vars["asymmetry_split_ev"].get()),
@@ -8900,11 +9772,11 @@ class AnalysisApp:
         self.initial_transition_precursor_figure.clear()
         axes = self.initial_transition_precursor_figure.subplots(1, 3)
         for axis, title, mask, color in [
-            (axes[0], "Initial State: Pixels That Later Became Metallic", metallic, "Reds"),
-            (axes[1], "Initial State: Pixels That Later Erased", erased, "Blues"),
-            (axes[2], "Initial State: Pixels That Later Became Both", both, "Purples"),
+            (axes[0], "Initial I_rat: Later Written", metallic, "Reds"),
+            (axes[1], "Initial I_rat: Later Erased", erased, "Blues"),
+            (axes[2], "Initial I_rat: Later Both", both, "Purples"),
         ]:
-            base = np.asarray(result.initial_near_ef_map, dtype=np.float32)
+            base = np.asarray(result.initial_feature_maps.get("I_rat_A0", result.initial_near_ef_map), dtype=np.float32)
             vmin, vmax = self._initial_transition_map_limits(base)
             axis.imshow(base.T, origin="lower", cmap="gray", aspect="auto", vmin=vmin, vmax=vmax, alpha=0.55)
             overlay = np.where(mask, 1.0, np.nan)
@@ -8930,14 +9802,13 @@ class AnalysisApp:
     def _initial_transition_spectrum_payload(self, state_index: int, x_index: int, y_index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         assert self.initial_transition_result is not None
         state = self.initial_transition_result.loaded_states[state_index]
-        data = np.asarray(state.data_array.values, dtype=np.float32)
-        x_safe = min(max(0, int(x_index)), data.shape[0] - 1)
-        y_safe = min(max(0, int(y_index)), data.shape[1] - 1)
+        x_safe = min(max(0, int(x_index)), int(state.data_array.sizes["x"]) - 1)
+        y_safe = min(max(0, int(y_index)), int(state.data_array.sizes["y"]) - 1)
         energy_axis = np.asarray(state.data_array.coords["eV"].values, dtype=np.float32)
         phi_axis = np.asarray(state.data_array.coords["phi"].values, dtype=np.float32)
         energy_order = np.argsort(energy_axis)
         phi_order = np.argsort(phi_axis)
-        spectrum = np.asarray(data[x_safe, y_safe, :, :], dtype=np.float32)
+        spectrum = np.asarray(state.data_array.isel(x=x_safe, y=y_safe).values, dtype=np.float32)
         return spectrum[energy_order][:, phi_order], energy_axis[energy_order], phi_axis[phi_order]
 
     def _refresh_initial_transition_diagnostics_plot(self) -> None:
@@ -9013,16 +9884,20 @@ class AnalysisApp:
             f"stable_count={int(result.aggregate_maps['stable_count'][x_index, y_index])}",
             f"metallic_frequency={float(result.aggregate_maps['metallic_frequency'][x_index, y_index]):.3f}, "
             f"erased_frequency={float(result.aggregate_maps['erased_frequency'][x_index, y_index]):.3f}",
+            f"initial I_rat={float(result.initial_feature_maps['I_rat_A0'][x_index, y_index]):.6g}, "
+            f"W_EF={float(result.initial_feature_maps['W_EF_A0'][x_index, y_index]):.6g}, "
+            f"W_LHB={float(result.initial_feature_maps['W_LHB_A0'][x_index, y_index]):.6g}",
             "",
             "Transition timeline:",
         ]
         for transition in result.transitions:
+            delta_irat = float(transition.metallicity_score[x_index, y_index])
             lines.append(
                 f"{transition.index}: {transition.name} | "
-                f"metallicity={float(transition.metallicity_score[x_index, y_index]):+.5g}, "
-                f"erasure={float(transition.erasure_score[x_index, y_index]):+.5g}, "
-                f"magnitude={float(transition.transition_magnitude[x_index, y_index]):.5g}, "
-                f"metallic={'yes' if transition.metallic_mask[x_index, y_index] else 'no'}, "
+                f"Delta_Irat={delta_irat:+.5g}, "
+                f"erase_score={float(transition.erasure_score[x_index, y_index]):+.5g}, "
+                f"|Delta|={float(transition.transition_magnitude[x_index, y_index]):.5g}, "
+                f"written={'yes' if transition.metallic_mask[x_index, y_index] else 'no'}, "
                 f"erased={'yes' if transition.erased_mask[x_index, y_index] else 'no'}, "
                 f"stable={'yes' if transition.stable_mask[x_index, y_index] else 'no'}"
             )
@@ -9053,10 +9928,10 @@ class AnalysisApp:
                 continue
             scale = float(np.nanmax(np.abs(mdc)))
             mdc_axis.plot(result.phi_axis, mdc / (scale if scale > 0 else 1.0), label=group, color=colors.get(group), linewidth=1.5)
-        edc_axis.set_title("Mean initial EDC by future behavior")
+        edc_axis.set_title("Mean initial EDC by future I_rat behavior")
         edc_axis.set_xlabel("eV")
         edc_axis.legend(fontsize=7)
-        mdc_axis.set_title("Mean initial near-EF MDC by future behavior")
+        mdc_axis.set_title("Mean initial near-EF MDC by future I_rat behavior")
         mdc_axis.set_xlabel("phi")
         mdc_axis.legend(fontsize=7)
         self.initial_transition_stats_canvas.draw_idle()
@@ -9064,9 +9939,9 @@ class AnalysisApp:
         for row in result.group_statistics:
             lines.append(
                 f"{row['group']}: n={row['number_of_pixels']}, "
-                f"mean near_EF={row.get('mean_near_EF_intensity_A0', float('nan')):.5g}, "
-                f"mean feature={row.get('mean_feature_window_intensity_A0', float('nan')):.5g}, "
-                f"mean peak width={row.get('mean_edc_peak_width_A0', float('nan')):.5g}"
+                f"mean I_rat={row.get('mean_I_rat_A0', float('nan')):.5g}, "
+                f"mean W_EF={row.get('mean_W_EF_A0', float('nan')):.5g}, "
+                f"mean W_LHB={row.get('mean_W_LHB_A0', float('nan')):.5g}"
             )
         self._set_text_widget(self.initial_transition_stats_text, "\n".join(lines))
 
@@ -9101,6 +9976,560 @@ class AnalysisApp:
             return
         self.initial_transition_status_var.set(f"Exported transition feature tables to {paths['metrics_table']}")
 
+    def _add_irat_transition_files(self) -> None:
+        selected = list(filedialog.askopenfilenames(title="Choose data files", filetypes=FILE_TYPES))
+        if not selected:
+            return
+        new_paths = [str(Path(path).expanduser().resolve()) for path in selected]
+        merged = self.irat_transition_file_paths + [
+            path for path in new_paths if path not in self.irat_transition_file_paths
+        ]
+        self._set_irat_transition_files(merged)
+
+    def _copy_analysis_files_to_irat_transition_panel(self) -> None:
+        if not self.file_paths:
+            messagebox.showinfo("No analysis files", "Add files to the Analysis panel first, or add files here directly.")
+            return
+        self._set_irat_transition_files(self.file_paths)
+
+    def _remove_selected_irat_transition_files(self) -> None:
+        selection = self._irat_transition_tree_selection_indices()
+        if not selection:
+            return
+        paths = list(self.irat_transition_file_paths)
+        for index in reversed(selection):
+            del paths[index]
+        self._set_irat_transition_files(paths)
+
+    def _clear_irat_transition_files(self) -> None:
+        self._set_irat_transition_files([])
+
+    def _move_selected_irat_transition_file(self, direction: int) -> None:
+        selection = self._irat_transition_tree_selection_indices()
+        if len(selection) != 1:
+            return
+        index = selection[0]
+        new_index = index + direction
+        if not 0 <= new_index < len(self.irat_transition_file_paths):
+            return
+        reference_index = self._irat_transition_reference_index()
+        reference_path = self.irat_transition_file_paths[reference_index] if self.irat_transition_file_paths else None
+        paths = list(self.irat_transition_file_paths)
+        paths[index], paths[new_index] = paths[new_index], paths[index]
+        excluded = set()
+        for old_index in self.irat_transition_excluded_indices:
+            if old_index == index:
+                excluded.add(new_index)
+            elif old_index == new_index:
+                excluded.add(index)
+            else:
+                excluded.add(old_index)
+        self.irat_transition_file_paths = paths
+        self.irat_transition_excluded_indices = excluded
+        if reference_path in self.irat_transition_file_paths:
+            self.irat_transition_reference_var.set(
+                self._irat_transition_reference_value(self.irat_transition_file_paths.index(reference_path))
+            )
+        self.irat_transition_result = None
+        self.irat_transition_selected_pixel = None
+        self._sync_irat_transition_file_tree()
+        self.irat_transition_file_tree.selection_set(str(new_index))
+        self._render_irat_transition_placeholder()
+
+    def _set_selected_irat_transition_reference(self) -> None:
+        selection = self._irat_transition_tree_selection_indices()
+        if not selection:
+            return
+        index = selection[0]
+        self.irat_transition_reference_var.set(self._irat_transition_reference_value(index))
+        self.irat_transition_excluded_indices.discard(index)
+        self._sync_irat_transition_file_tree()
+
+    def _toggle_selected_irat_transition_file(self) -> None:
+        for index in self._irat_transition_tree_selection_indices():
+            reference = self._irat_transition_reference_index()
+            if index == reference:
+                continue
+            if index in self.irat_transition_excluded_indices:
+                self.irat_transition_excluded_indices.remove(index)
+            else:
+                self.irat_transition_excluded_indices.add(index)
+        self._sync_irat_transition_file_tree()
+
+    def _irat_transition_tree_selection_indices(self) -> list[int]:
+        if not hasattr(self, "irat_transition_file_tree"):
+            return []
+        indices: list[int] = []
+        for item in self.irat_transition_file_tree.selection():
+            try:
+                indices.append(int(item))
+            except ValueError:
+                continue
+        return sorted(index for index in indices if 0 <= index < len(self.irat_transition_file_paths))
+
+    def _set_irat_transition_files(self, file_paths: list[str]) -> None:
+        previous_reference_path = None
+        if self.irat_transition_file_paths:
+            reference = self._irat_transition_reference_index()
+            if 0 <= reference < len(self.irat_transition_file_paths):
+                previous_reference_path = self.irat_transition_file_paths[reference]
+        self.irat_transition_file_paths = list(file_paths)
+        self.irat_transition_excluded_indices = {
+            index for index in self.irat_transition_excluded_indices if index < len(file_paths)
+        }
+        self.irat_transition_result = None
+        self.irat_transition_selected_pixel = None
+        self.mechanism_result = None
+        self.mechanism_selected_pixel = None
+        if file_paths:
+            reference_index = 0
+            if previous_reference_path in self.irat_transition_file_paths:
+                reference_index = self.irat_transition_file_paths.index(previous_reference_path)
+            self.irat_transition_reference_var.set(self._irat_transition_reference_value(reference_index))
+            self.irat_transition_excluded_indices.discard(reference_index)
+        else:
+            self.irat_transition_reference_var.set("")
+        self._sync_irat_transition_file_tree()
+        self._render_irat_transition_placeholder()
+        self._render_mechanism_placeholder()
+
+    def _irat_transition_reference_value(self, index: int) -> str:
+        if not 0 <= index < len(self.irat_transition_file_paths):
+            return ""
+        return f"{index}: {self._short_file_label(self.irat_transition_file_paths[index], 28)}"
+
+    def _irat_transition_reference_index(self) -> int:
+        text = self.irat_transition_reference_var.get().strip()
+        try:
+            index = int(text.split(":", 1)[0])
+        except ValueError:
+            index = 0
+        if not self.irat_transition_file_paths:
+            return 0
+        return min(max(0, index), len(self.irat_transition_file_paths) - 1)
+
+    def _sync_irat_transition_file_tree(self) -> None:
+        if not hasattr(self, "irat_transition_file_tree"):
+            return
+        self.irat_transition_file_tree.delete(*self.irat_transition_file_tree.get_children())
+        reference = self._irat_transition_reference_index()
+        values = [self._irat_transition_reference_value(index) for index in range(len(self.irat_transition_file_paths))]
+        self.irat_transition_reference_combo.configure(values=values)
+        if values and self.irat_transition_reference_var.get() not in values:
+            self.irat_transition_reference_var.set(values[0])
+            reference = 0
+        for index, path in enumerate(self.irat_transition_file_paths):
+            if index in self.irat_transition_excluded_indices:
+                role = "excluded"
+                included = "no"
+            elif index == reference:
+                role = "initial reference"
+                included = "yes"
+            else:
+                role = "transition state"
+                included = "yes"
+            note = "A0" if index == reference else ""
+            self.irat_transition_file_tree.insert(
+                "",
+                tk.END,
+                iid=str(index),
+                values=(index, Path(path).name, role, included, note),
+            )
+
+    def _parse_irat_transition_parameters(self) -> InitialTransitionFeatureParameters:
+        included_original_indices = [
+            index for index in range(len(self.irat_transition_file_paths))
+            if index not in self.irat_transition_excluded_indices
+        ]
+        reference_original = self._irat_transition_reference_index()
+        if reference_original not in included_original_indices:
+            included_original_indices.insert(0, reference_original)
+        reference_included = included_original_indices.index(reference_original)
+        try:
+            params = InitialTransitionFeatureParameters(
+                fermi_level_ev=float(self.irat_transition_parameter_vars["fermi_level_ev"].get()),
+                ef_min_ev=float(self.irat_transition_parameter_vars["ef_min_ev"].get()),
+                ef_max_ev=float(self.irat_transition_parameter_vars["ef_max_ev"].get()),
+                lhb_center_ev=float(self.irat_transition_parameter_vars["lhb_center_ev"].get()),
+                lhb_halfwidth_ev=float(self.irat_transition_parameter_vars["lhb_halfwidth_ev"].get()),
+                smooth_sigma=float(self.irat_transition_parameter_vars["smooth_sigma"].get()),
+                feature_min_ev=float(self.irat_transition_parameter_vars["feature_min_ev"].get()),
+                feature_max_ev=float(self.irat_transition_parameter_vars["feature_max_ev"].get()),
+                asymmetry_split_ev=float(self.irat_transition_parameter_vars["asymmetry_split_ev"].get()),
+                metallic_percentile=float(self.irat_transition_parameter_vars["metallic_percentile"].get()),
+                erasure_percentile=float(self.irat_transition_parameter_vars["erasure_percentile"].get()),
+                stable_percentile=float(self.irat_transition_parameter_vars["stable_percentile"].get()),
+                transition_mode=self.irat_transition_mode_var.get(),
+                reference_index=reference_included,
+                normalization_mode=self.irat_transition_normalization_var.get(),
+                allow_overlap=bool(self.irat_transition_allow_overlap_var.get()),
+            )
+        except ValueError as exc:
+            raise ValueError(f"Could not parse Irat Transition Map controls: {exc}") from exc
+        params.validate()
+        return params
+
+    def _irat_transition_included_files(self) -> list[str]:
+        included = [
+            path for index, path in enumerate(self.irat_transition_file_paths)
+            if index not in self.irat_transition_excluded_indices
+        ]
+        reference = self._irat_transition_reference_index()
+        if self.irat_transition_file_paths and self.irat_transition_file_paths[reference] not in included:
+            included.insert(0, self.irat_transition_file_paths[reference])
+        return included
+
+    def _run_irat_transition_analysis(self) -> None:
+        files = self._irat_transition_included_files()
+        if len(files) < 2:
+            messagebox.showerror("Missing files", "Please choose at least two included data files.")
+            return
+        try:
+            params = self._parse_irat_transition_parameters()
+        except Exception as exc:
+            messagebox.showerror("Invalid parameters", str(exc))
+            return
+        self.irat_transition_status_var.set("Computing Irat Transition Maps...")
+        self._start_global_progress("Irat Transition Maps running...")
+        self.root.update_idletasks()
+        try:
+            self.irat_transition_result = run_initial_transition_feature_analysis(files, params)
+        except Exception as exc:
+            self.irat_transition_result = None
+            self.mechanism_result = None
+            self.irat_transition_status_var.set("Irat Transition Maps failed.")
+            self._finish_global_progress("Irat Transition Maps failed.", success=False)
+            messagebox.showerror("Irat Transition Maps failed", str(exc))
+            self._render_irat_transition_placeholder()
+            self._render_mechanism_placeholder()
+            return
+        self.mechanism_result = None
+        self.mechanism_selected_pixel = None
+        self.irat_transition_selected_pixel = self._default_irat_transition_pixel()
+        self._sync_irat_transition_transition_combo()
+        self._refresh_irat_transition_views()
+        self._render_mechanism_placeholder()
+        result = self.irat_transition_result
+        self.irat_transition_status_var.set(
+            f"Computed {result.n_transitions} I_rat transition(s) over {result.shape[0]} x {result.shape[1]} pixels."
+        )
+        self._finish_global_progress("Irat Transition Maps complete.")
+
+    def _sync_irat_transition_transition_combo(self) -> None:
+        if not hasattr(self, "irat_transition_selected_transition_combo"):
+            return
+        result = self.irat_transition_result
+        values = [] if result is None else [
+            f"{transition.index}: {transition.name}"
+            for transition in result.transitions
+        ]
+        self.irat_transition_selected_transition_combo.configure(values=values)
+        if values and self.irat_transition_selected_transition_var.get() not in values:
+            self.irat_transition_selected_transition_var.set(values[0])
+        elif not values:
+            self.irat_transition_selected_transition_var.set("")
+
+    def _default_irat_transition_pixel(self) -> tuple[int, int]:
+        result = self.irat_transition_result
+        if result is None:
+            return (0, 0)
+        score = np.asarray(result.aggregate_maps["metallic_count"] + result.aggregate_maps["erased_count"], dtype=np.float32)
+        if np.any(score > 0):
+            return divmod(int(np.nanargmax(score)), score.shape[1])
+        return (0, 0)
+
+    def _render_irat_transition_placeholder(self) -> None:
+        for attr, message in [
+            ("irat_transition_aggregate_figure", "Add/order files, choose a reference, then compute I_rat write/erase maps."),
+            ("irat_transition_precursor_figure", "Initial I_rat precursor masks will appear here."),
+            ("irat_transition_diagnostics_figure", "Click a pixel after computing to inspect spectra and I_rat transition labels."),
+            ("irat_transition_stats_figure", "Population average EDC/MDC curves will appear here."),
+        ]:
+            if not hasattr(self, attr):
+                continue
+            figure = getattr(self, attr)
+            figure.clear()
+            axis = figure.add_subplot(111)
+            axis.text(0.5, 0.5, message, ha="center", va="center", fontsize=12)
+            axis.set_axis_off()
+        if hasattr(self, "irat_transition_aggregate_canvas"):
+            self.irat_transition_aggregate_canvas.draw_idle()
+            self.irat_transition_precursor_canvas.draw_idle()
+            self.irat_transition_diagnostics_canvas.draw_idle()
+            self.irat_transition_stats_canvas.draw_idle()
+        if hasattr(self, "irat_transition_timeline_text"):
+            self._set_text_widget(self.irat_transition_timeline_text, "")
+        if hasattr(self, "irat_transition_stats_text"):
+            self._set_text_widget(self.irat_transition_stats_text, "")
+
+    def _refresh_irat_transition_views(self) -> None:
+        if self.irat_transition_result is None:
+            self._render_irat_transition_placeholder()
+            return
+        if self.irat_transition_selected_pixel is None:
+            self.irat_transition_selected_pixel = self._default_irat_transition_pixel()
+        self._refresh_irat_transition_aggregate_plot()
+        self._refresh_irat_transition_precursor_plot()
+        self._refresh_irat_transition_diagnostics_plot()
+        self._refresh_irat_transition_population_plot()
+
+    def _future_masks_from_irat_transition_controls(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        assert self.irat_transition_result is not None
+        result = self.irat_transition_result
+        try:
+            metallic_min = max(0, int(float(self.irat_transition_parameter_vars["future_metallic_min_count"].get())))
+            erased_min = max(0, int(float(self.irat_transition_parameter_vars["future_erased_min_count"].get())))
+        except ValueError:
+            metallic_min, erased_min = 1, 1
+        metallic = result.aggregate_maps["metallic_count"] >= metallic_min
+        erased = result.aggregate_maps["erased_count"] >= erased_min
+        return metallic, erased, metallic & erased
+
+    def _refresh_irat_transition_aggregate_plot(self) -> None:
+        assert self.irat_transition_result is not None
+        result = self.irat_transition_result
+        self.irat_transition_aggregate_figure.clear()
+        self.irat_transition_map_axes = []
+        keys = [
+            "metallic_count",
+            "erased_count",
+            "stable_count",
+            "metallic_frequency",
+            "erased_frequency",
+            self.INITIAL_TRANSITION_AGGREGATE_MAP_OPTIONS.get(self.irat_transition_aggregate_map_var.get(), "max_metallicity_score"),
+        ]
+        titles = [
+            "written_count",
+            "erased_count",
+            "stable_count",
+            "written_frequency",
+            "erased_frequency",
+            self.irat_transition_aggregate_map_var.get(),
+        ]
+        axes = self.irat_transition_aggregate_figure.subplots(2, 3, squeeze=False)
+        for axis, key, title in zip(axes.reshape(-1), keys, titles):
+            data = np.asarray(result.aggregate_maps[key], dtype=np.float32)
+            vmin, vmax = (None, None)
+            if "score" in key:
+                vmin, vmax = self._initial_transition_map_limits(data, symmetric=False)
+            image = axis.imshow(data.T, origin="lower", cmap="viridis", aspect="auto", vmin=vmin, vmax=vmax)
+            axis.set_title(title)
+            axis.set_xlabel("x")
+            axis.set_ylabel("y")
+            self._mark_irat_transition_selected_pixel(axis)
+            self.irat_transition_map_axes.append(axis)
+            self.irat_transition_aggregate_figure.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
+        self.irat_transition_aggregate_canvas.draw_idle()
+
+    def _refresh_irat_transition_precursor_plot(self) -> None:
+        assert self.irat_transition_result is not None
+        result = self.irat_transition_result
+        metallic, erased, both = self._future_masks_from_irat_transition_controls()
+        self.irat_transition_precursor_figure.clear()
+        axes = self.irat_transition_precursor_figure.subplots(1, 3)
+        for axis, title, mask, color in [
+            (axes[0], "Initial I_rat: Later Written", metallic, "Reds"),
+            (axes[1], "Initial I_rat: Later Erased", erased, "Blues"),
+            (axes[2], "Initial I_rat: Later Both", both, "Purples"),
+        ]:
+            base = np.asarray(result.initial_feature_maps.get("I_rat_A0", result.initial_near_ef_map), dtype=np.float32)
+            vmin, vmax = self._initial_transition_map_limits(base)
+            axis.imshow(base.T, origin="lower", cmap="gray", aspect="auto", vmin=vmin, vmax=vmax, alpha=0.55)
+            overlay = np.where(mask, 1.0, np.nan)
+            axis.imshow(overlay.T, origin="lower", cmap=color, aspect="auto", vmin=0, vmax=1, alpha=0.78)
+            axis.set_title(title, fontsize=9)
+            axis.set_xlabel("x")
+            axis.set_ylabel("y")
+            self._mark_irat_transition_selected_pixel(axis)
+            self.irat_transition_map_axes.append(axis)
+        self.irat_transition_precursor_canvas.draw_idle()
+
+    def _selected_irat_transition_index(self) -> int:
+        result = self.irat_transition_result
+        if result is None or not result.transitions:
+            return 0
+        text = self.irat_transition_selected_transition_var.get().strip()
+        try:
+            index = int(text.split(":", 1)[0])
+        except ValueError:
+            index = 0
+        return min(max(0, index), result.n_transitions - 1)
+
+    def _irat_transition_spectrum_payload(self, state_index: int, x_index: int, y_index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        assert self.irat_transition_result is not None
+        state = self.irat_transition_result.loaded_states[state_index]
+        x_safe = min(max(0, int(x_index)), int(state.data_array.sizes["x"]) - 1)
+        y_safe = min(max(0, int(y_index)), int(state.data_array.sizes["y"]) - 1)
+        energy_axis = np.asarray(state.data_array.coords["eV"].values, dtype=np.float32)
+        phi_axis = np.asarray(state.data_array.coords["phi"].values, dtype=np.float32)
+        energy_order = np.argsort(energy_axis)
+        phi_order = np.argsort(phi_axis)
+        spectrum = np.asarray(state.data_array.isel(x=x_safe, y=y_safe).values, dtype=np.float32)
+        return spectrum[energy_order][:, phi_order], energy_axis[energy_order], phi_axis[phi_order]
+
+    def _refresh_irat_transition_diagnostics_plot(self) -> None:
+        assert self.irat_transition_result is not None
+        result = self.irat_transition_result
+        x_index, y_index = self.irat_transition_selected_pixel or self._default_irat_transition_pixel()
+        transition = result.transitions[self._selected_irat_transition_index()]
+        self.irat_transition_diagnostics_figure.clear()
+        axes = self.irat_transition_diagnostics_figure.subplots(2, 3)
+        spectrum, energy_axis, phi_axis = self._irat_transition_spectrum_payload(result.initial_reference_index, x_index, y_index)
+        axes[0, 0].imshow(
+            spectrum,
+            origin="lower",
+            aspect="auto",
+            extent=[float(phi_axis[0]), float(phi_axis[-1]), float(energy_axis[0]), float(energy_axis[-1])],
+            cmap="viridis",
+        )
+        axes[0, 0].set_title(f"Initial local spectrum\nx={x_index}, y={y_index}")
+        axes[0, 0].set_xlabel("phi")
+        axes[0, 0].set_ylabel("eV")
+        for state_index, state in enumerate(result.loaded_states):
+            local_spectrum, e_axis, p_axis = self._irat_transition_spectrum_payload(state_index, x_index, y_index)
+            edc = np.trapezoid(local_spectrum, x=p_axis, axis=1) if p_axis.size > 1 else np.sum(local_spectrum, axis=1)
+            scale = float(np.nanmax(np.abs(edc))) if np.any(np.isfinite(edc)) else 1.0
+            axes[0, 1].plot(e_axis, edc / (scale if scale > 0 else 1.0), linewidth=1.0, alpha=0.7, label=str(state_index))
+            ef_mask = (e_axis >= result.parameters.fermi_level_ev + result.parameters.ef_min_ev) & (e_axis <= result.parameters.fermi_level_ev + result.parameters.ef_max_ev)
+            if not np.any(ef_mask):
+                ef_mask[int(np.argmin(np.abs(e_axis - result.parameters.fermi_level_ev)))] = True
+            mdc = np.trapezoid(local_spectrum[ef_mask, :], x=e_axis[ef_mask], axis=0) if int(np.count_nonzero(ef_mask)) > 1 else np.sum(local_spectrum[ef_mask, :], axis=0)
+            scale_mdc = float(np.nanmax(np.abs(mdc))) if np.any(np.isfinite(mdc)) else 1.0
+            axes[0, 2].plot(p_axis, mdc / (scale_mdc if scale_mdc > 0 else 1.0), linewidth=1.0, alpha=0.7, label=str(state_index))
+        axes[0, 1].set_title("EDC across files")
+        axes[0, 1].set_xlabel("eV")
+        axes[0, 1].legend(fontsize=6)
+        axes[0, 2].set_title("Near-EF MDC across files")
+        axes[0, 2].set_xlabel("phi")
+        axes[0, 2].legend(fontsize=6)
+        before = transition.before_index
+        after = transition.after_index
+        spec_a, e_axis, p_axis = self._irat_transition_spectrum_payload(before, x_index, y_index)
+        spec_b, _e, _p = self._irat_transition_spectrum_payload(after, x_index, y_index)
+        diff = spec_b - spec_a
+        limit = self._symmetric_change_limit(diff)
+        axes[1, 0].imshow(diff, origin="lower", aspect="auto", extent=[float(p_axis[0]), float(p_axis[-1]), float(e_axis[0]), float(e_axis[-1])], cmap="coolwarm", vmin=-limit, vmax=limit)
+        axes[1, 0].set_title(f"B - A spectrum\nDelta I_rat={float(transition.metallicity_score[x_index, y_index]):+.4g}")
+        edc_a = np.trapezoid(spec_a, x=p_axis, axis=1) if p_axis.size > 1 else np.sum(spec_a, axis=1)
+        edc_b = np.trapezoid(spec_b, x=p_axis, axis=1) if p_axis.size > 1 else np.sum(spec_b, axis=1)
+        axes[1, 1].plot(e_axis, edc_a, label="A")
+        axes[1, 1].plot(e_axis, edc_b, label="B")
+        axes[1, 1].plot(e_axis, edc_b - edc_a, label="B-A", color="#444444")
+        axes[1, 1].set_title("Transition EDC")
+        axes[1, 1].set_xlabel("eV")
+        axes[1, 1].legend(fontsize=7)
+        ef_mask = (e_axis >= result.parameters.fermi_level_ev + result.parameters.ef_min_ev) & (e_axis <= result.parameters.fermi_level_ev + result.parameters.ef_max_ev)
+        mdc_a = np.trapezoid(spec_a[ef_mask, :], x=e_axis[ef_mask], axis=0) if int(np.count_nonzero(ef_mask)) > 1 else np.sum(spec_a[ef_mask, :], axis=0)
+        mdc_b = np.trapezoid(spec_b[ef_mask, :], x=e_axis[ef_mask], axis=0) if int(np.count_nonzero(ef_mask)) > 1 else np.sum(spec_b[ef_mask, :], axis=0)
+        axes[1, 2].plot(p_axis, mdc_a, label="A")
+        axes[1, 2].plot(p_axis, mdc_b, label="B")
+        axes[1, 2].plot(p_axis, mdc_b - mdc_a, label="B-A", color="#444444")
+        axes[1, 2].set_title("Transition MDC")
+        axes[1, 2].set_xlabel("phi")
+        axes[1, 2].legend(fontsize=7)
+        self.irat_transition_diagnostics_canvas.draw_idle()
+        self._update_irat_transition_timeline_text(x_index, y_index)
+
+    def _update_irat_transition_timeline_text(self, x_index: int, y_index: int) -> None:
+        assert self.irat_transition_result is not None
+        result = self.irat_transition_result
+        lines = [
+            f"Pixel x={x_index}, y={y_index}",
+            f"written_count={int(result.aggregate_maps['metallic_count'][x_index, y_index])}, "
+            f"erased_count={int(result.aggregate_maps['erased_count'][x_index, y_index])}, "
+            f"stable_count={int(result.aggregate_maps['stable_count'][x_index, y_index])}",
+            f"initial I_rat={float(result.initial_feature_maps['I_rat_A0'][x_index, y_index]):.6g}, "
+            f"W_EF={float(result.initial_feature_maps['W_EF_A0'][x_index, y_index]):.6g}, "
+            f"W_LHB={float(result.initial_feature_maps['W_LHB_A0'][x_index, y_index]):.6g}",
+            "",
+            "Transition timeline:",
+        ]
+        for transition in result.transitions:
+            delta_irat = float(transition.metallicity_score[x_index, y_index])
+            lines.append(
+                f"{transition.index}: {transition.name} | "
+                f"Delta_Irat={delta_irat:+.5g}, "
+                f"erase_score={float(transition.erasure_score[x_index, y_index]):+.5g}, "
+                f"|Delta|={float(transition.transition_magnitude[x_index, y_index]):.5g}, "
+                f"written={'yes' if transition.metallic_mask[x_index, y_index] else 'no'}, "
+                f"erased={'yes' if transition.erased_mask[x_index, y_index] else 'no'}, "
+                f"stable={'yes' if transition.stable_mask[x_index, y_index] else 'no'}"
+            )
+        if result.notes:
+            lines.extend(["", "Notes:"])
+            lines.extend(f"- {note}" for note in result.notes[:4])
+        self._set_text_widget(self.irat_transition_timeline_text, "\n".join(lines))
+
+    def _refresh_irat_transition_population_plot(self) -> None:
+        assert self.irat_transition_result is not None
+        result = self.irat_transition_result
+        self.irat_transition_stats_figure.clear()
+        edc_axis, mdc_axis = self.irat_transition_stats_figure.subplots(1, 2)
+        colors = {
+            "future metallic": "#e6550d",
+            "future erased": "#3182bd",
+            "both metallic and erased": "#9467bd",
+            "stable": "#2ca02c",
+            "never switched": "#777777",
+        }
+        for group, edc in result.average_initial_edcs.items():
+            if not np.any(np.isfinite(edc)):
+                continue
+            scale = float(np.nanmax(np.abs(edc)))
+            edc_axis.plot(result.e_axis, edc / (scale if scale > 0 else 1.0), label=group, color=colors.get(group), linewidth=1.5)
+        for group, mdc in result.average_initial_mdcs.items():
+            if not np.any(np.isfinite(mdc)):
+                continue
+            scale = float(np.nanmax(np.abs(mdc)))
+            mdc_axis.plot(result.phi_axis, mdc / (scale if scale > 0 else 1.0), label=group, color=colors.get(group), linewidth=1.5)
+        edc_axis.set_title("Mean initial EDC by future I_rat behavior")
+        edc_axis.set_xlabel("eV")
+        edc_axis.legend(fontsize=7)
+        mdc_axis.set_title("Mean initial near-EF MDC by future I_rat behavior")
+        mdc_axis.set_xlabel("phi")
+        mdc_axis.legend(fontsize=7)
+        self.irat_transition_stats_canvas.draw_idle()
+        lines = ["Group statistics:"]
+        for row in result.group_statistics:
+            lines.append(
+                f"{row['group']}: n={row['number_of_pixels']}, "
+                f"mean I_rat={row.get('mean_I_rat_A0', float('nan')):.5g}, "
+                f"mean W_EF={row.get('mean_W_EF_A0', float('nan')):.5g}, "
+                f"mean W_LHB={row.get('mean_W_LHB_A0', float('nan')):.5g}"
+            )
+        self._set_text_widget(self.irat_transition_stats_text, "\n".join(lines))
+
+    def _mark_irat_transition_selected_pixel(self, axis: matplotlib.axes.Axes) -> None:
+        if self.irat_transition_selected_pixel is None:
+            return
+        x_index, y_index = self.irat_transition_selected_pixel
+        axis.scatter([x_index], [y_index], s=90, facecolors="none", edgecolors="white", linewidths=1.8)
+        axis.scatter([x_index], [y_index], s=18, c="black")
+
+    def _on_irat_transition_plot_click(self, event: matplotlib.backend_bases.MouseEvent) -> None:
+        if self.irat_transition_result is None or event.inaxes is None or event.xdata is None or event.ydata is None:
+            return
+        x_index = int(round(event.xdata))
+        y_index = int(round(event.ydata))
+        x_size, y_size = self.irat_transition_result.shape
+        if 0 <= x_index < x_size and 0 <= y_index < y_size:
+            self.irat_transition_selected_pixel = (x_index, y_index)
+            self._refresh_irat_transition_views()
+
+    def _save_irat_transition_results(self) -> None:
+        if self.irat_transition_result is None:
+            messagebox.showinfo("No results", "Compute Irat Transition Maps before exporting.")
+            return
+        directory = filedialog.askdirectory(title="Choose output folder for Irat Transition Maps")
+        if not directory:
+            return
+        try:
+            paths = export_initial_transition_feature_analysis(self.irat_transition_result, directory)
+        except Exception as exc:
+            messagebox.showerror("Export failed", str(exc))
+            return
+        self.irat_transition_status_var.set(f"Exported Irat transition tables to {paths['metrics_table']}")
+
     def _add_mechanism_files(self) -> None:
         selected = list(filedialog.askopenfilenames(title="Choose data files", filetypes=FILE_TYPES))
         if not selected:
@@ -9121,6 +10550,16 @@ class AnalysisApp:
             messagebox.showinfo(
                 "No initial-state files",
                 "Add files to Initial State Transition Features first, or add files here directly.",
+            )
+            return
+        self._set_mechanism_files(files)
+
+    def _copy_irat_transition_files_to_mechanism(self) -> None:
+        files = self._irat_transition_included_files()
+        if len(files) < 2:
+            messagebox.showinfo(
+                "No Irat transition files",
+                "Add files to Irat Transition Maps first, or add files here directly.",
             )
             return
         self._set_mechanism_files(files)
@@ -9180,22 +10619,32 @@ class AnalysisApp:
         initial_files = self._initial_transition_included_files()
         if len(initial_files) >= 2:
             return initial_files
+        irat_files = self._irat_transition_included_files()
+        if len(irat_files) >= 2:
+            return irat_files
         if len(self.file_paths) >= 2:
             return list(self.file_paths)
         return []
 
-    def _parse_mechanism_parameters(self) -> SwitchingMechanismParameters:
+    def _parse_mechanism_parameters(self, source: str = "files") -> SwitchingMechanismParameters:
         try:
             threshold_values = tuple(
                 float(part.strip())
                 for part in self.mechanism_parameter_vars["threshold_sweep_percentiles"].get().split(",")
                 if part.strip()
             )
-            transition_params = (
-                self.initial_transition_result.parameters
-                if self.initial_transition_result is not None
-                else self._parse_initial_transition_parameters()
-            )
+            if source == "irat" and self.irat_transition_result is not None:
+                transition_params = self.irat_transition_result.parameters
+            elif source == "initial" and self.initial_transition_result is not None:
+                transition_params = self.initial_transition_result.parameters
+            elif source == "files" and self.initial_transition_result is not None:
+                transition_params = self.initial_transition_result.parameters
+            elif source == "files" and self.irat_transition_result is not None:
+                transition_params = self.irat_transition_result.parameters
+            elif source == "irat":
+                transition_params = self._parse_irat_transition_parameters()
+            else:
+                transition_params = self._parse_initial_transition_parameters()
             params = SwitchingMechanismParameters(
                 transition_parameters=transition_params,
                 future_metallic_min_count=max(0, int(float(self.mechanism_parameter_vars["future_metallic_min_count"].get()))),
@@ -9224,13 +10673,19 @@ class AnalysisApp:
             messagebox.showinfo("Diagnostics running", "Switching Mechanism Diagnostics is already running.")
             return
         try:
-            params = self._parse_mechanism_parameters()
+            params = self._parse_mechanism_parameters(source)
         except Exception as exc:
             messagebox.showerror("Invalid parameters", str(exc))
             return
         transition_result: InitialTransitionFeatureResult | None = None
         files: list[str] | None = None
-        if source == "initial":
+        if source == "irat":
+            transition_result = self.irat_transition_result
+            if transition_result is None:
+                files = self._irat_transition_included_files()
+                if len(files) < 2:
+                    files = self._mechanism_input_files()
+        elif source == "initial":
             transition_result = self.initial_transition_result
             if transition_result is None:
                 files = self._initial_transition_included_files()
@@ -9250,6 +10705,7 @@ class AnalysisApp:
             "Computing switching mechanism diagnostics... loading files, computing transition metrics, and building diagnostic plots."
         )
         self.mechanism_worker_queue = queue.Queue()
+        self.mechanism_worker_source = source
 
         def worker() -> None:
             try:
@@ -9272,7 +10728,7 @@ class AnalysisApp:
         self._start_global_progress("Switching Mechanism Diagnostics running...")
         if hasattr(self, "mechanism_progress"):
             self.mechanism_progress.start(12)
-        for attr in ("mechanism_compute_button", "mechanism_initial_compute_button", "mechanism_export_button"):
+        for attr in ("mechanism_compute_button", "mechanism_initial_compute_button", "mechanism_irat_compute_button", "mechanism_export_button"):
             if hasattr(self, attr):
                 getattr(self, attr).configure(state=tk.DISABLED)
         self.root.update_idletasks()
@@ -9280,7 +10736,7 @@ class AnalysisApp:
     def _stop_mechanism_progress(self) -> None:
         if hasattr(self, "mechanism_progress"):
             self.mechanism_progress.stop()
-        for attr in ("mechanism_compute_button", "mechanism_initial_compute_button", "mechanism_export_button"):
+        for attr in ("mechanism_compute_button", "mechanism_initial_compute_button", "mechanism_irat_compute_button", "mechanism_export_button"):
             if hasattr(self, attr):
                 getattr(self, attr).configure(state=tk.NORMAL)
 
@@ -9303,9 +10759,19 @@ class AnalysisApp:
             self._render_mechanism_placeholder()
             return
         self.mechanism_result = payload  # type: ignore[assignment]
-        self.initial_transition_result = self.mechanism_result.transition_result
-        self._sync_initial_transition_transition_combo()
-        self.mechanism_selected_pixel = self.initial_transition_selected_pixel or self._default_mechanism_pixel()
+        transition_result = self.mechanism_result.transition_result
+        if self.mechanism_worker_source == "irat":
+            self.irat_transition_result = transition_result
+            if self.irat_transition_selected_pixel is None:
+                self.irat_transition_selected_pixel = self._default_irat_transition_pixel()
+            self._sync_irat_transition_transition_combo()
+            self.mechanism_selected_pixel = self.irat_transition_selected_pixel or self._default_mechanism_pixel()
+        else:
+            self.initial_transition_result = transition_result
+            if self.initial_transition_selected_pixel is None:
+                self.initial_transition_selected_pixel = self._default_initial_transition_pixel()
+            self._sync_initial_transition_transition_combo()
+            self.mechanism_selected_pixel = self.initial_transition_selected_pixel or self._default_mechanism_pixel()
         self._sync_mechanism_transition_combo()
         self._refresh_mechanism_views()
         verdict = self.mechanism_result.summary_verdict
@@ -9774,14 +11240,13 @@ class AnalysisApp:
     def _mechanism_spectrum_payload(self, state_index: int, x_index: int, y_index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         assert self.mechanism_result is not None
         state = self.mechanism_result.transition_result.loaded_states[state_index]
-        data = np.asarray(state.data_array.values, dtype=np.float32)
-        x_safe = min(max(0, int(x_index)), data.shape[0] - 1)
-        y_safe = min(max(0, int(y_index)), data.shape[1] - 1)
+        x_safe = min(max(0, int(x_index)), int(state.data_array.sizes["x"]) - 1)
+        y_safe = min(max(0, int(y_index)), int(state.data_array.sizes["y"]) - 1)
         energy_axis = np.asarray(state.data_array.coords["eV"].values, dtype=np.float32)
         phi_axis = np.asarray(state.data_array.coords["phi"].values, dtype=np.float32)
         energy_order = np.argsort(energy_axis)
         phi_order = np.argsort(phi_axis)
-        spectrum = np.asarray(data[x_safe, y_safe, :, :], dtype=np.float32)
+        spectrum = np.asarray(state.data_array.isel(x=x_safe, y=y_safe).values, dtype=np.float32)
         return spectrum[energy_order][:, phi_order], energy_axis[energy_order], phi_axis[phi_order]
 
     def _mechanism_selected_pixel_timeline(self, x_index: int, y_index: int) -> list[dict[str, object]]:
@@ -9861,7 +11326,7 @@ class AnalysisApp:
             messagebox.showinfo("No analysis files", "Add files to the Analysis panel first, or add files here directly.")
             return
         self._set_transition_outcome_files(self.file_paths)
-        self.top_notebook.select(8)
+        self.top_notebook.select(self.ANALYSIS_PANEL_OPTIONS.index("Transition Outcome Maps"))
 
     def _remove_selected_transition_outcome_files(self) -> None:
         selection = list(self.transition_outcome_file_listbox.curselection())

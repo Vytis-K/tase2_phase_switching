@@ -60,6 +60,9 @@ class SwitchingMLDatasetParameters:
     fermi_level_ev: float = 0.0
     ef_min_ev: float = -0.05
     ef_max_ev: float = 0.05
+    lhb_center_ev: float = -0.18
+    lhb_halfwidth_ev: float = 0.05
+    smooth_sigma: float = 1.0
     feature_min_ev: float = -0.30
     feature_max_ev: float = -0.05
     asymmetry_split_ev: float = -0.15
@@ -83,6 +86,9 @@ class SwitchingMLDatasetParameters:
             fermi_level_ev=self.fermi_level_ev,
             ef_min_ev=self.ef_min_ev,
             ef_max_ev=self.ef_max_ev,
+            lhb_center_ev=self.lhb_center_ev,
+            lhb_halfwidth_ev=self.lhb_halfwidth_ev,
+            smooth_sigma=self.smooth_sigma,
             feature_min_ev=self.feature_min_ev,
             feature_max_ev=self.feature_max_ev,
             asymmetry_split_ev=self.asymmetry_split_ev,
@@ -261,10 +267,16 @@ def build_ml_feature_maps(
     near = np.asarray(initial_features["near_EF_intensity_A0"], dtype=np.float32)
     feature = np.asarray(initial_features["feature_window_intensity_A0"], dtype=np.float32)
     total = np.asarray(initial_features["total_spectral_weight_A0"], dtype=np.float32)
+    i_rat = np.asarray(initial_features["I_rat_A0"], dtype=np.float32)
+    w_ef = np.asarray(initial_features["W_EF_A0"], dtype=np.float32)
+    w_lhb = np.asarray(initial_features["W_LHB_A0"], dtype=np.float32)
     safe_feature = np.where(np.abs(feature) > epsilon, feature, np.nan)
     safe_total = np.where(np.abs(total) > epsilon, total, np.nan)
 
     feature_maps: dict[str, np.ndarray] = {
+        "I_rat_A0": i_rat,
+        "W_EF_A0": w_ef,
+        "W_LHB_A0": w_lhb,
         "near_EF_intensity_A0": near,
         "feature_window_intensity_A0": feature,
         "initial_I_ratio_A0": (near / safe_feature).astype(np.float32),
@@ -291,6 +303,9 @@ def build_ml_feature_maps(
     }
     groups = {
         "spectral": [
+            "I_rat_A0",
+            "W_EF_A0",
+            "W_LHB_A0",
             "near_EF_intensity_A0",
             "feature_window_intensity_A0",
             "initial_I_ratio_A0",
@@ -598,8 +613,8 @@ def build_metadata(
         "target_names": target_names,
         "target_counts": target_counts,
         "score_threshold_notes": {
-            "future_metallic": "1 when metallic_count/frequency filters pass; metallic_count is the number of transitions where near-EF weight increased above the per-transition percentile threshold.",
-            "future_erased": "1 when erased_count/frequency filters pass; erased_count is the number of transitions where feature-window weight was lost above the per-transition percentile threshold.",
+            "future_metallic": "1 when metallic_count/frequency filters pass; metallic_count is the number of transitions where I_rat = W_EF / W_LHB increased above the positive per-transition percentile threshold.",
+            "future_erased": "1 when erased_count/frequency filters pass; erased_count is the number of transitions where I_rat decreased above the positive erasure-score percentile threshold.",
             "repeated_switching": "1 when metallic_count + erased_count is at least 2.",
             "outcome_class": "0=never switched, 1=stable control, 2=future metallic only, 3=future erased only, 4=both metallic and erased.",
         },
@@ -625,8 +640,8 @@ def dataset_readme(metadata: dict[str, Any]) -> str:
             "Recommended first targets:",
             "",
             "- `future_active`: any later metallic or erased behavior.",
-            "- `future_metallic`: later gain of near-EF weight.",
-            "- `future_erased`: later loss of feature-window weight.",
+            "- `future_metallic`: later positive Delta I_rat.",
+            "- `future_erased`: later negative Delta I_rat.",
             "- `repeated_switching`: switched in more than one transition.",
             "",
             "Use spatial-blocked validation when training so neighboring pixels do not leak between train/test.",
@@ -655,6 +670,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--stable-percentile", type=float, default=25.0)
     parser.add_argument("--ef-min", type=float, default=-0.05)
     parser.add_argument("--ef-max", type=float, default=0.05)
+    parser.add_argument("--lhb-center", type=float, default=-0.18)
+    parser.add_argument("--lhb-halfwidth", type=float, default=0.05)
+    parser.add_argument("--smooth-sigma", type=float, default=1.0)
     parser.add_argument("--feature-min", type=float, default=-0.30)
     parser.add_argument("--feature-max", type=float, default=-0.05)
     parser.add_argument("--future-metallic-min-count", type=int, default=1)
@@ -668,6 +686,9 @@ def main(argv: list[str] | None = None) -> None:
     params = SwitchingMLDatasetParameters(
         ef_min_ev=args.ef_min,
         ef_max_ev=args.ef_max,
+        lhb_center_ev=args.lhb_center,
+        lhb_halfwidth_ev=args.lhb_halfwidth,
+        smooth_sigma=args.smooth_sigma,
         feature_min_ev=args.feature_min,
         feature_max_ev=args.feature_max,
         metallic_percentile=args.metallic_percentile,

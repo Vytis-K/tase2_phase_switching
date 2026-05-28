@@ -26,6 +26,7 @@ from tase2_phase_switching.analysis import (
     StatePredictionParameters,
     SwitchingMechanismParameters,
     SwitchingMapParameters,
+    TiltMapParameters,
     TransitionOutcomeParameters,
     analyze_cluster_physical_interpretation,
     export_analysis,
@@ -35,6 +36,7 @@ from tase2_phase_switching.analysis import (
     export_state_classification,
     export_state_prediction,
     export_switching_map,
+    export_tilt_map,
     export_transition_outcome_maps,
     initial_state_feature_rows,
     initial_transition_metric_rows,
@@ -48,10 +50,12 @@ from tase2_phase_switching.analysis import (
     run_state_classification,
     run_state_prediction,
     run_switching_map,
+    run_tilt_map,
     run_transition_outcome_maps,
     state_classification_table_rows,
     state_prediction_table_rows,
     switching_map_table_rows,
+    tilt_map_table_rows,
     transition_outcome_table_rows,
 )
 
@@ -404,6 +408,45 @@ class AnalysisPipelineTest(unittest.TestCase):
             self.assertTrue(exported["summary"].exists())
             self.assertTrue((exported["feature_maps"] / "I_rat.npy").exists())
 
+    def test_tilt_map_and_export(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            file_path = build_synthetic_dataset(tmp_path / "tilt_map.nc", state_index=1)
+
+            result = run_tilt_map(
+                file_path,
+                TiltMapParameters(
+                    band_min_ev=-0.25,
+                    band_max_ev=0.04,
+                    defect_tilt_percentile=85.0,
+                    defect_gradient_percentile=85.0,
+                    group_count=4,
+                    min_group_size=2,
+                ),
+            )
+
+            self.assertEqual(result.shape, (18, 16))
+            self.assertEqual(result.tilt_map.shape, (18, 16))
+            self.assertTrue(np.any(np.isfinite(result.tilt_map)))
+            self.assertEqual(result.group_mean_tilt_map.shape, (18, 16))
+            self.assertEqual(result.defect_mask.shape, (18, 16))
+            self.assertIn("high_abs_tilt", result.thresholds)
+            self.assertIn("signal_floor_band_weight", result.thresholds)
+            self.assertGreaterEqual(len(result.group_rows), 1)
+
+            rows = tilt_map_table_rows(result)
+            self.assertEqual(len(rows), 18 * 16)
+            self.assertIn("tilt_phi", rows[0])
+            self.assertIn("region_mean_tilt_phi", rows[0])
+            self.assertIn("defect_label", rows[0])
+
+            exported = export_tilt_map(result, tmp_path / "tilt_export")
+            self.assertTrue(exported["pixel_table"].exists())
+            self.assertTrue(exported["group_table"].exists())
+            self.assertTrue((exported["maps"] / "tilt_phi.npy").exists())
+            self.assertTrue((exported["maps"] / "region_mean_tilt_phi.npy").exists())
+            self.assertTrue(exported["summary"].exists())
+
     def test_switching_map_sequence_and_export(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -563,8 +606,16 @@ class AnalysisPipelineTest(unittest.TestCase):
             self.assertEqual(result.aggregate_maps["erased_count"].shape, (18, 16))
             self.assertEqual(result.aggregate_maps["first_metallic_transition"].shape, (18, 16))
             self.assertTrue(np.any(result.future_metallic_mask))
+            self.assertIn("I_rat_A0", result.initial_feature_maps)
+            self.assertIn("W_EF_A0", result.initial_feature_maps)
+            self.assertIn("W_LHB_A0", result.initial_feature_maps)
             self.assertIn("near_EF_intensity_A0", result.initial_feature_maps)
             self.assertIn("local_spatial_gradient_A0", result.initial_feature_maps)
+            first_transition = result.transitions[0]
+            np.testing.assert_allclose(first_transition.erasure_score, -first_transition.metallicity_score)
+            np.testing.assert_allclose(first_transition.transition_magnitude, np.abs(first_transition.metallicity_score))
+            self.assertTrue(np.all(first_transition.metallicity_score[first_transition.metallic_mask] > 0))
+            self.assertTrue(np.all(first_transition.metallicity_score[first_transition.erased_mask] < 0))
             self.assertIn("future metallic", result.average_initial_edcs)
             self.assertEqual(result.average_initial_edcs["future metallic"].shape, result.e_axis.shape)
             self.assertEqual(result.average_initial_mdcs["future metallic"].shape, result.phi_axis.shape)
@@ -575,6 +626,7 @@ class AnalysisPipelineTest(unittest.TestCase):
             self.assertEqual(len(metric_rows), 18 * 16)
             self.assertEqual(len(feature_rows), 18 * 16)
             self.assertIn("metallic_transition_files", metric_rows[0])
+            self.assertIn("I_rat_A0", feature_rows[0])
             self.assertIn("near_EF_intensity_A0", feature_rows[0])
 
             exported = export_initial_transition_feature_analysis(result, tmp_path / "initial_transition_export")

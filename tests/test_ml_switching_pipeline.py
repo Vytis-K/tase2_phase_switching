@@ -77,6 +77,7 @@ class MLSwitchingPipelineTest(unittest.TestCase):
             self.assertIn("targets", arrays.files)
             self.assertGreater(arrays["X"].shape[0], 0)
             self.assertGreater(arrays["X"].shape[1], 5)
+            self.assertIn("I_rat_A0", [str(name) for name in arrays["feature_names"]])
 
             trained = train_from_dataset(
                 TrainConfig(
